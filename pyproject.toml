@@ -1,0 +1,32 @@
+[project]
+name = "zimtty"
+version = "0.1.0"
+description = "Keyboard-first, paginated terminal reader for ZIM files (offline Wikipedia and other wikis)"
+readme = "README.md"
+authors = [
+    { name = "illmet", email = "ilyaamet@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "libzim>=3.13.0",
+    "selectolax>=0.4.12",
+    "textual>=8.2.8",
+]
+
+[project.scripts]
+zimtty = "zimtty:main"
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
