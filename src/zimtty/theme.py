@@ -5,6 +5,7 @@ import os
 import tomllib
 from pathlib import Path
 
+from textual.color import Color, ColorParseError
 from textual.theme import Theme
 
 from .zimdoc import Palette
@@ -20,16 +21,57 @@ FALLBACK = {  # tokyo-night-ish, used when not on Omarchy
 }
 
 
-def read_colors() -> dict:
+class ThemeError(ValueError):
+    """The configured theme cannot safely supply application colors."""
+
+
+def _validated_colors(values: dict) -> dict:
+    if not isinstance(values, dict):
+        raise ThemeError("Theme colors must be a table.")
+    c = dict(values)
+    # Older/third-party themes may define only color0..15.
+    aliases = {"blue": "color4", "magenta": "color5"}
+    for key, default in FALLBACK.items():
+        if key != "accent":
+            c.setdefault(key, c.get(aliases[key], default) if key in aliases else default)
+    if "accent" not in c or (isinstance(c["accent"], str) and not c["accent"].strip()):
+        c["accent"] = c["blue"]
+    if not isinstance(c["mode"], str) or c["mode"] not in ("dark", "light"):
+        raise ThemeError("Theme mode must be 'dark' or 'light'.")
+    # Validate blue before the accent that may have inherited its value.
+    color_keys = [key for key in FALLBACK if key not in ("mode", "accent")] + ["accent"]
+    for key in color_keys:
+        value = c[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ThemeError(f"Theme color '{key}' must be a non-empty color string.")
+        value = value.strip()
+        try:
+            Color.parse(value)
+        except (ColorParseError, ValueError, OverflowError) as error:
+            raise ThemeError(f"Invalid color for theme field '{key}'.") from error
+        c[key] = value
+    return c
+
+
+def read_colors(strict: bool = False) -> dict:
+    """Load validated colors; strict reloads can retain the previous theme on error.
+
+    A missing file means no Omarchy theme is active and always uses the default.
+    Other read or validation errors raise ThemeError only when strict is enabled.
+    """
     try:
         with open(COLORS, "rb") as f:
             c = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError):
-        return dict(FALLBACK)
-    # older/third-party themes may only define color0..15; fill gaps
-    for k, v in FALLBACK.items():
-        c.setdefault(k, c.get("color" + {"blue": "4", "magenta": "5"}.get(k, "x"), v))
-    return c
+        return _validated_colors(c)
+    except FileNotFoundError:
+        pass
+    except ThemeError:
+        if strict:
+            raise
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        if strict:
+            raise ThemeError("Could not read valid theme colors.") from error
+    return _validated_colors(FALLBACK)
 
 
 def colors_mtime() -> float:
@@ -40,16 +82,23 @@ def colors_mtime() -> float:
 
 
 def build(c: dict) -> tuple[Palette, Theme]:
+    c = _validated_colors(c)
     fg = c["foreground"]
-    accent = c.get("accent") or c["blue"]
+    accent = c["accent"]
+    # Rich styles need opaque RGB colors; Textual also accepts short hex, alpha,
+    # and ANSI color names which Rich cannot parse directly.
+    rgb = {
+        key: Color.parse(c[key]).hex6.lower()
+        for key in FALLBACK if key != "mode"
+    }
     pal = Palette(
-        fg=fg,
-        bright=c.get("bright_foreground", fg),
-        muted=c.get("muted", "#808080"),
-        accent=accent,
-        link=c.get("blue", accent),
-        heading=c.get("bright_foreground", fg),
-        sub=accent,
+        fg=rgb["foreground"],
+        bright=rgb["bright_foreground"],
+        muted=rgb["muted"],
+        accent=rgb["accent"],
+        link=rgb["blue"],
+        heading=rgb["bright_foreground"],
+        sub=rgb["accent"],
     )
     theme = Theme(
         name="omarchy",

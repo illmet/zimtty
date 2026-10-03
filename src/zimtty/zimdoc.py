@@ -1,16 +1,15 @@
 """ZIM access and HTML -> Article model.
 
-The mwoffliner HTML (Parsoid output) is very regular:
-  <section data-mw-section-id="0">  lead: infobox, hatnotes, lead paragraphs
-  <section data-mw-section-id="N">  <div class="mw-heading mw-heading2"><h2 id=..>
-      nested <section> for h3/h4 ...
-We walk that tree once and produce a flat list of Blocks, which is what the
-paginator works on. Styling is baked into rich Text using the current palette.
+Walk common HTML containers in document order, retaining structured code and
+tables alongside styled prose, infobox data, and anchor/TOC information. Both
+modern section-based and older flat MediaWiki exports use this shared model.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from itertools import count
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 from libzim.reader import Archive
 from libzim.suggestion import SuggestionSearcher
@@ -18,16 +17,37 @@ from rich.style import Style
 from rich.text import Text
 from selectolax.parser import HTMLParser, Node
 
+from .safety import safe_text
+
 # ---------------------------------------------------------------- model
 
 
 @dataclass
+class TableCell:
+    text: Text
+    header: bool = False
+    preformatted: bool = False
+
+
+@dataclass
+class TableData:
+    rows: list[list[TableCell]]
+    caption: Text = field(default_factory=Text)
+    simple: bool = True
+    # Explicit single-cell rows spanning an otherwise rectangular grid. Keep
+    # their original positions; no expansion or inference of other merged cells.
+    full_width_rows: frozenset[int] = frozenset()
+
+
+@dataclass
 class Block:
-    kind: str  # title | h2 | h3 | h4 | para | item | quote | hatnote | ref | placeholder
+    kind: str  # title | h2 | h3 | h4 | para | item | quote | hatnote | ref | pre | table | infobox
     text: Text
     anchor: str | None = None  # heading id, for TOC / #fragment jumps
     indent: int = 0
     hang: int = 0  # width of the bullet/number prefix, for hanging indents
+    anchors: tuple[str, ...] = ()  # IDs/name aliases, carried through rearrangement
+    table: TableData | None = None
 
 
 @dataclass
@@ -53,6 +73,8 @@ class Article:
     infobox: list[InfoRow]
     notes: list[Text]  # lead hatnotes + maintenance boxes, moved out of the lead
     toc: list[TocEntry] = field(default_factory=list)
+    anchors: dict[str, int] = field(default_factory=dict)
+    base_href: str | None = None
 
 
 @dataclass
@@ -67,6 +89,41 @@ class Palette:
 
 
 # ---------------------------------------------------------------- constants
+
+# Bounds apply to uncompressed HTML before content loading, and to the parsed
+# element tree before any recursive walker. TeX exceeding its nesting bound is
+# displayed as raw source. These limits allow normal articles while rejecting
+# input that would exhaust memory or the Python recursion stack.
+MAX_ARTICLE_BYTES = 16 * 1024 * 1024
+MAX_DOM_DEPTH = 128
+MAX_TEX_DEPTH = 64
+
+
+class ArticleError(ValueError):
+    """An article exceeds the supported resource limits."""
+
+
+def _check_article_size(size: int) -> None:
+    if size > MAX_ARTICLE_BYTES:
+        raise ArticleError("Article HTML exceeds the maximum size of 16 MiB.")
+
+
+def _check_dom_depth(tree: HTMLParser) -> None:
+    """Validate element nesting iteratively, using memory proportional to depth."""
+    if tree.root is None:
+        return
+    stack = [iter((tree.root,))]
+    while stack:
+        node = next(stack[-1], None)
+        if node is None:
+            stack.pop()
+            continue
+        if len(stack) > MAX_DOM_DEPTH:
+            raise ArticleError(
+                f"Article HTML exceeds the maximum nesting depth of {MAX_DOM_DEPTH}."
+            )
+        stack.append(iter(node.iter()))
+
 
 # Blocks we never show in the reading view.
 SKIP_BLOCK_CLASSES = {
@@ -101,7 +158,7 @@ BACK_MATTER = {
 NOTES_TITLE = "Additional notes"
 
 WS = re.compile(r"[ \t\r\n\f\u00a0]+")
-INVISIBLE = str.maketrans("", "", "\u200b\u200c\u200d\u2060\ufeff\u00ad")
+INVISIBLE = str.maketrans("", "", "\u200b\u2060\ufeff\u00ad")
 
 
 def classes(node: Node) -> set[str]:
@@ -158,18 +215,25 @@ class _Tex:
 
     def __init__(self, s: str):
         self.s, self.i = s, 0
+        self.depth = 0
 
     def group(self) -> str:
         """One argument: {...} or a single token."""
-        self.ws()
-        if self.i >= len(self.s):
-            return ""
-        if self.s[self.i] == "{":
-            self.i += 1
-            out = self.seq("}")
-            self.i += 1  # skip }
-            return out
-        return self.token()
+        if self.depth >= MAX_TEX_DEPTH:
+            raise ValueError("TeX nesting limit exceeded")
+        self.depth += 1
+        try:
+            self.ws()
+            if self.i >= len(self.s):
+                return ""
+            if self.s[self.i] == "{":
+                self.i += 1
+                out = self.seq("}")
+                self.i += 1  # skip }
+                return out
+            return self.token()
+        finally:
+            self.depth -= 1
 
     def ws(self):
         while self.i < len(self.s) and self.s[self.i] == " ":
@@ -223,12 +287,13 @@ class _Tex:
 
 
 def tex_to_text(s: str) -> str:
+    s = safe_text(s)
     if "\\" not in s and "^" not in s and "_" not in s and "{" not in s:
         return s
     try:
         t = _Tex(re.sub(r"\s+([\^_])", r"\1", s)).seq()
-    except (ValueError, AttributeError, IndexError):
-        return s  # malformed TeX: show it raw rather than crash
+    except (ValueError, AttributeError, IndexError, RecursionError):
+        return s  # malformed or too deeply nested TeX: show the safe raw source
     t = re.sub(r"\s*([=<>≤≥≠≈∈∉⊂⊆→⇒⇔±×])\s*", r" \1 ", t)
     t = re.sub(r"\s+([,)\]])", r"\1", t)
     t = re.sub(r"([(\[])\s+", r"\1", t)
@@ -241,6 +306,34 @@ def hidden(node: Node) -> bool:
 
 
 # ---------------------------------------------------------------- inline text
+
+_LINK_IDS = count()
+
+
+def local_href(href: str) -> bool:
+    """Only archive-relative URLs are actionable; never launch external schemes."""
+    try:
+        parsed = urlsplit(href)
+    except ValueError:
+        return False
+    return bool(href) and not parsed.scheme and not parsed.netloc and not href.startswith("//")
+
+
+def archive_href(href: str, base_path: str, base_href: str | None = None) -> tuple[str, str | None] | None:
+    """Resolve a local HTML URL inside an archive, without any filesystem/network IO.
+
+    Split query/fragment before percent-decoding so encoded '#' and '?' remain
+    part of the entry name. An external HTML base is ignored: exported wikis
+    often retain their original website's base while their links are local.
+    """
+    if not local_href(href):
+        return None
+    base = "/" + quote(base_path.lstrip("/"), safe="/")
+    if base_href and local_href(base_href):
+        base = urljoin(base, base_href)
+    parsed = urlsplit(urljoin(base, href))
+    fragment = parsed.fragment if parsed.fragment or "#" in href else None
+    return unquote(parsed.path).lstrip("/"), fragment
 
 
 class InlineBuilder:
@@ -257,73 +350,86 @@ class InlineBuilder:
         self._walk(node, None)
         return self._finish()
 
+    def build_nodes(self, nodes: list[Node]) -> Text:
+        """Build an inline run including each supplied node's own tag/style."""
+        for node in nodes:
+            self._visit(node, None)
+        return self._finish()
+
     def _brk(self):
         self.segs.append(("\n", None))
 
     def _walk(self, node: Node, style: Style | None):
         for ch in node.iter(include_text=True):
-            tag = ch.tag
-            if tag == "-text":
-                s = (ch.text_content or "").translate(INVISIBLE)
-                if s:
-                    self.segs.append((s, style))
-                continue
-            if tag in SKIP_TAGS or hidden(ch):
-                continue
-            cls = classes(ch)
-            if cls & SKIP_INLINE_CLASSES:
-                continue
-            if tag == "sup" and ("mw-ref" in cls or "reference" in cls):
-                if self.show_refs:
-                    self.segs.append((ch.text(strip=True), Style(color=self.pal.muted, dim=True)))
-                continue
-            if tag == "br":
-                self._brk()
-                continue
-            if tag == "a":
-                href = ch.attributes.get("href") or ""
-                if ch.attributes.get("role") == "button":
-                    continue
-                if self.links and href and not href.startswith(("#", "http:", "https:", "//", "mailto:")):
-                    # "@click" meta makes Textual run the action on mouse click
-                    link = Style(color=self.pal.link, underline=True,
-                                 meta={"href": href, "@click": f"app.follow({href!r})"})
-                    self._walk(ch, (style + link) if style else link)
-                else:
-                    self._walk(ch, style)
-                continue
-            if tag in ("b", "strong"):
-                s2 = Style(bold=True)
-                self._walk(ch, (style + s2) if style else s2)
-                continue
-            if tag in ("i", "em", "cite", "var"):
-                s2 = Style(italic=True)
-                self._walk(ch, (style + s2) if style else s2)
-                continue
-            if "mwe-math-element" in cls:
-                ann = ch.css_first("annotation")
-                tex = ann.text() if ann else ""
-                img = ch.css_first("img")
-                alt = (img.attributes.get("alt") if img else "") or tex
-                alt = alt.strip()
-                if alt.startswith("{\\displaystyle") and alt.endswith("}"):
-                    alt = alt[len("{\\displaystyle"):-1].strip()
-                self.segs.append((tex_to_text(alt), Style(italic=True, color=self.pal.sub)))
-                continue
-            if tag in ("ul", "ol", "dl", "table") and not self.boxy:
-                continue  # nested block lists are handled by the block walker
-            if self.boxy and tag in ("li", "div", "p", "tr", "dd", "dt"):
-                self._brk()
+            self._visit(ch, style)
+
+    def _visit(self, ch: Node, style: Style | None):
+        tag = ch.tag
+        if tag == "-text":
+            s = (ch.text_content or "").translate(INVISIBLE)
+            if s:
+                self.segs.append((s, style))
+            return
+        if tag in SKIP_TAGS or hidden(ch):
+            return
+        cls = classes(ch)
+        if cls & SKIP_INLINE_CLASSES:
+            return
+        if tag == "sup" and ("mw-ref" in cls or "reference" in cls):
+            if self.show_refs:
+                self.segs.append((ch.text(strip=True), Style(color=self.pal.muted, dim=True)))
+            return
+        if tag == "br":
+            self._brk()
+            return
+        if tag == "a":
+            href = ch.attributes.get("href") or ""
+            if ch.attributes.get("role") == "button":
+                return
+            if self.links and local_href(href):
+                link = Style(color=self.pal.link, underline=True,
+                             meta={"href": href, "link_id": next(_LINK_IDS),
+                                   "@click": f"app.follow({href!r})"})
+                self._walk(ch, (style + link) if style else link)
+            else:
                 self._walk(ch, style)
-                self._brk()
-                continue
+            return
+        if tag in ("b", "strong", "i", "em", "cite", "var", "code", "kbd", "samp"):
+            if tag in ("b", "strong"):
+                added = Style(bold=True)
+            elif tag in ("code", "kbd", "samp"):
+                added = Style(color=self.pal.sub)
+            else:
+                added = Style(italic=True)
+            self._walk(ch, (style + added) if style else added)
+            return
+        if "mwe-math-element" in cls:
+            ann = ch.css_first("annotation")
+            tex = ann.text() if ann else ""
+            img = ch.css_first("img")
+            alt = (img.attributes.get("alt") if img else "") or tex
+            alt = alt.strip()
+            if alt.startswith("{\\displaystyle") and alt.endswith("}"):
+                alt = alt[len("{\\displaystyle"):-1].strip()
+            self.segs.append((tex_to_text(alt), Style(italic=True, color=self.pal.sub)))
+            return
+        if tag in ("ul", "ol", "dl", "table", "pre") and not self.boxy:
+            return  # nested blocks are handled by the block walker
+        if self.boxy and tag in ("li", "div", "p", "tr", "dd", "dt", "pre"):
+            self._brk()
             self._walk(ch, style)
+            self._brk()
+            return
+        self._walk(ch, style)
 
     def _finish(self) -> Text:
         out = Text()
         pending_space = False
         at_line_start = True
         for s, st in self.segs:
+            # All segments have already passed through HTML entity decoding,
+            # including reference labels and TeX extracted from attributes.
+            s = safe_text(s)
             if s == "\n":
                 if not at_line_start:
                     out.append("\n")
@@ -359,62 +465,60 @@ class ArticleParser:
         return InlineBuilder(self.pal, self.show_refs, boxy, self.links).build(node)
 
     def parse(self, path: str, html: str) -> Article:
+        # Reject obviously oversized input before allocating its UTF-8 copy.
+        _check_article_size(len(html))
+        _check_article_size(len(html.encode("utf-8")))
         tree = HTMLParser(html)
-        h1 = tree.css_first("h1")
-        title = h1.text(strip=True) if h1 else (tree.css_first("title").text(strip=True) if tree.css_first("title") else path)
+        _check_dom_depth(tree)
+        root = (tree.css_first(".mw-parser-output") or tree.css_first("#mw-content-text")
+                or tree.css_first("main") or tree.css_first("article") or tree.body)
+        h1 = (root.css_first("h1") if root is not None else None) or tree.css_first("h1")
+        title = self.inline(h1).plain if h1 else (tree.css_first("title").text(strip=True) if tree.css_first("title") else path)
+        title = safe_text(title)
         self.infobox: list[InfoRow] = []
         self.notes: list[Text] = []
+        self._note_blocks: list[Block] = []
+        self._title_node_id = h1.mem_id if h1 else None
+        self._title_anchors = list(self._node_anchors(h1, deep=True)) if h1 else []
         self._seen_heading = False
         self._article_title = title
-        sections = [s for s in tree.css("section") if s.parent is None or s.parent.tag != "section"]
-
+        mediawiki = bool(tree.css_first(".mw-parser-output, #mw-content-text, [data-mw-section-id]"))
+        flat: list[Block] = []
+        trailing = self._walk(root, flat, in_lead=True) if root is not None else ()
+        if trailing and flat:
+            self._add_anchors(flat[-1], trailing)
         lead: list[Block] = []
         top: list[tuple[Block, list[Block]]] = []  # (h2 block, body)
-        if not sections:
-            # Older mwoffliner (<=1.16): flat .mw-parser-output, no <section> wrappers.
-            # Walk it once, then cut at h2 headings.
-            root = tree.css_first(".mw-parser-output") or tree.css_first("#mw-content-text") or tree.body
-            flat: list[Block] = []
-            if root is not None:
-                self._walk(root, flat, in_lead=True)
-            for b in flat:
-                if b.kind == "h2":
-                    top.append((b, []))
-                elif top:
-                    top[-1][1].append(b)
-                else:
-                    lead.append(b)
-        for sec in sections:
-            sid = sec.attributes.get("data-mw-section-id")
-            if sid == "0":
-                self._walk(sec, lead, in_lead=True)
+        for b in flat:
+            if b.kind == "h2":
+                top.append((b, []))
+            elif top:
+                top[-1][1].append(b)
             else:
-                body: list[Block] = []
-                self._walk(sec, body, in_lead=False)
-                if body and body[0].kind == "h2":
-                    top.append((body[0], body[1:]))
-                elif top:
-                    top[-1][1].extend(body)
-                else:
-                    lead.extend(body)
-
-        main = [(h, b) for h, b in top if h.text.plain.strip().lower() not in BACK_MATTER]
-        back = [(h, b) for h, b in top if h.text.plain.strip().lower() in BACK_MATTER]
+                lead.append(b)
+        if mediawiki or self.notes:
+            main = [(h, b) for h, b in top if h.text.plain.strip().lower() not in BACK_MATTER]
+            back = [(h, b) for h, b in top if h.text.plain.strip().lower() in BACK_MATTER]
+        else:
+            main, back = top, []
         if self.notes:
             nh = Block("h2", Text(NOTES_TITLE), anchor="__notes__")
-            main.append((nh, [Block("hatnote", n) for n in self.notes]))
+            main.append((nh, self._note_blocks))
 
-        blocks = [Block("title", Text(title), anchor="__top__")] + lead
+        title_aliases = tuple(dict.fromkeys(self._title_anchors))
+        blocks = [Block("title", Text(title), anchor="__top__", anchors=title_aliases)] + lead
+        if trailing and not flat:
+            self._add_anchors(blocks[0], trailing)
         for h, b in main + back:
-            b = [x for x in b if x.kind not in ("h2",)]
-            if not b:
-                continue
             blocks.append(h)
             blocks.extend(b)
         blocks = self._drop_empty_headings(blocks)
-
-        art = Article(path=path, title=title, blocks=blocks, infobox=self.infobox, notes=self.notes)
+        base = tree.css_first("base[href]")
+        art = Article(path=path, title=title, blocks=blocks, infobox=self.infobox,
+                      notes=self.notes, base_href=base.attributes["href"] if base else None)
         for i, b in enumerate(blocks):
+            for anchor in ((b.anchor,) if b.anchor else ()) + b.anchors:
+                art.anchors.setdefault(anchor, i)
             if b.kind in ("h2", "h3", "h4"):
                 art.toc.append(TocEntry(i, int(b.kind[1]), b.text.plain, b.anchor))
         return art
@@ -423,15 +527,46 @@ class ArticleParser:
     def _drop_empty_headings(blocks: list[Block]) -> list[Block]:
         rank = {"h2": 2, "h3": 3, "h4": 4}
         out: list[Block] = []
+        pending: list[str] = []
         for i, b in enumerate(blocks):
             if b.kind in rank:
-                if not b.text.plain.strip():
-                    continue  # heading made only of template junk
-                nxt = next((x for x in blocks[i + 1:]), None)
-                if nxt is None or (nxt.kind in rank and rank[nxt.kind] <= rank[b.kind]):
+                nxt = blocks[i + 1] if i + 1 < len(blocks) else None
+                if (not b.text.plain.strip() or nxt is None
+                        or (nxt.kind in rank and rank[nxt.kind] <= rank[b.kind])):
+                    pending.extend(((b.anchor,) if b.anchor else ()) + b.anchors)
                     continue
+            ArticleParser._add_anchors(b, pending)
+            pending.clear()
             out.append(b)
+        if pending and out:
+            ArticleParser._add_anchors(out[-1], pending)
         return out
+
+    @staticmethod
+    def _add_anchors(block: Block, anchors) -> None:
+        block.anchors = tuple(dict.fromkeys((*block.anchors, *anchors)))
+
+    @staticmethod
+    def _skip(node: Node) -> bool:
+        return (node.tag in (SKIP_TAGS - {"figure"}) or node.tag in ("nav", "footer", "form")
+                or hidden(node) or bool(classes(node) & (SKIP_BLOCK_CLASSES | SKIP_INLINE_CLASSES))
+                or node.attributes.get("role") in ("navigation", "banner", "contentinfo", "search")
+                or node.attributes.get("id") in ("toc", "mw-navigation", "mw-panel", "catlinks", "jump-to-nav")
+                or bool(classes(node) & {"toc", "mw-jump-link", "printfooter", "catlinks"}))
+
+    def _node_anchors(self, node: Node, deep: bool = False) -> tuple[str, ...]:
+        found: list[str] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if self._skip(current):
+                continue
+            ident = current.attributes.get("id")
+            name = current.attributes.get("name") if current.tag == "a" else None
+            found.extend(value for value in (ident, name) if value)
+            if deep:
+                stack.extend(reversed(list(current.iter())))
+        return tuple(dict.fromkeys(found))
 
     def _heading_text(self, h: Node) -> Text:
         # headings can contain <style> (navbox templates); use the inline walker
@@ -439,91 +574,226 @@ class ArticleParser:
         return Text(t.plain)
 
     # -- block level
-    def _walk(self, node: Node, out: list[Block], in_lead: bool):
-        for ch in node.iter():
-            tag = ch.tag
-            if tag in SKIP_TAGS or hidden(ch):
+    def _walk(self, node: Node, out: list[Block], in_lead: bool,
+              indent: int = 0, list_depth: int = 0, content_only: bool = False) -> tuple[str, ...]:
+        """Walk one container once, preserving runs of inline text between blocks."""
+        inline_nodes: list[Node] = []
+        pending = list(self._node_anchors(node))
+        structural = {"div", "section", "main", "article", "header", "aside", "address",
+                      "p", "pre", "ul", "ol", "li", "dl", "dt", "dd", "blockquote",
+                      "table", "details", "summary", "center", "figure", "figcaption",
+                      "h1", "h2", "h3", "h4", "h5", "h6"}
+
+        def flush():
+            if not inline_nodes:
+                return
+            text = InlineBuilder(self.pal, self.show_refs, links=self.links).build_nodes(inline_nodes)
+            for child in inline_nodes:
+                if child.tag != "-text":
+                    pending.extend(self._node_anchors(child, deep=True))
+            if text.plain.strip():
+                out.append(Block("para", text, indent=indent, anchors=tuple(dict.fromkeys(pending))))
+                pending.clear()
+            inline_nodes.clear()
+
+        for ch in node.iter(include_text=True):
+            if ch.tag == "-text":
+                inline_nodes.append(ch)
+                continue
+            if self._skip(ch):
                 continue
             cls = classes(ch)
-            if tag == "section":
-                self._walk(ch, out, in_lead=False)
-            elif "mw-heading" in cls:
-                h = ch.css_first("h2, h3, h4, h5, h6")
-                if h:
-                    self._seen_heading = True
-                    lvl = min(int(h.tag[1]), 4)
-                    out.append(Block(f"h{lvl}", self._heading_text(h), anchor=h.attributes.get("id")))
-            elif tag in ("h2", "h3", "h4", "h5", "h6"):
-                self._seen_heading = True
-                lvl = min(int(tag[1]), 4)
-                out.append(Block(f"h{lvl}", self._heading_text(ch), anchor=ch.attributes.get("id")))
-            elif cls & NOTE_CLASSES:
-                t = self._note_text(ch)
-                if t.plain:
-                    self.notes.append(t)
-            elif "hatnote" in cls or "dablink" in cls:
-                t = self.inline(ch)
-                if not t.plain:
-                    continue
-                if in_lead and not self._seen_heading:
-                    self.notes.append(t)
-                else:
-                    t.stylize(Style(italic=True, color=self.pal.muted))
-                    out.append(Block("hatnote", t))
-            elif tag == "table" and "infobox" in cls:
-                if not self.infobox:
-                    self.infobox = self._infobox(ch)
-            elif cls & SKIP_BLOCK_CLASSES:
+            if ch.tag not in structural and not (cls & NOTE_CLASSES or cls & {"hatnote", "dablink"}):
+                inline_nodes.append(ch)
                 continue
-            elif tag == "p":
-                t = self.inline(ch)
-                if t.plain:
-                    out.append(Block("para", t))
-            elif tag in ("ul", "ol"):
-                self._list(ch, out, 0)
-            elif tag == "dl":
-                for d in ch.iter():
-                    t = self.inline(d)
-                    if not t.plain:
-                        continue
-                    if d.tag == "dt":
-                        t.stylize("bold")
-                        out.append(Block("para", t))
-                    else:
-                        out.append(Block("quote" if d.tag == "dd" else "para", t, indent=2))
-            elif tag == "blockquote" or "quotebox" in cls or "templatequote" in cls:
-                t = self.inline(ch, boxy=True)
-                if t.plain:
-                    t.stylize(Style(italic=True))
-                    out.append(Block("quote", t, indent=4))
-            elif tag == "table":
-                cap = ch.css_first("caption")
-                name = cap.text(strip=True) if cap else ""
-                rows = len(ch.css("tr"))
-                out.append(Block("placeholder", Text(f"[ table{': ' + name if name else ''} · {rows} rows · not shown yet ]", Style(color=self.pal.muted, italic=True))))
-            elif "mw-references-wrap" in cls or "reflist" in cls or "refbegin" in cls or tag == "div":
-                # generic containers (div-col, reflist, stack, ...): descend
-                self._walk(ch, out, in_lead)
+            flush()
+            before = len(out)
+            remaining = self._block(ch, out, in_lead, indent, list_depth, content_only)
+            if len(out) > before:
+                self._add_anchors(out[before], pending)
+                pending.clear()
+            pending.extend(remaining)
+        flush()
+        return tuple(dict.fromkeys(pending))
 
-    def _list(self, lst: Node, out: list[Block], depth: int):
+    def _block(self, node: Node, out: list[Block], in_lead: bool,
+               indent: int, list_depth: int, content_only: bool) -> tuple[str, ...]:
+        tag, cls = node.tag, classes(node)
+        aliases = self._node_anchors(node)
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            text = self._heading_text(node)
+            anchors = self._node_anchors(node, deep=True)
+            if tag == "h1" and (node.mem_id == self._title_node_id
+                                or text.plain.strip() == self._article_title.strip()):
+                self._title_anchors.extend(anchors)
+                return ()
+            if not content_only:
+                self._seen_heading = True
+            level = max(2, min(int(tag[1]), 4))
+            out.append(Block(f"h{level}", text, anchor=anchors[0] if anchors else None,
+                             anchors=anchors, indent=indent))
+        elif tag == "pre":
+            text = Text(self._pre_text(node))
+            if text.plain:
+                out.append(Block("pre", text, indent=indent, anchors=self._node_anchors(node, deep=True)))
+            else:
+                return aliases
+        elif tag in ("ul", "ol"):
+            return self._list(node, out, list_depth, indent, content_only)
+        elif tag == "table" and "infobox" in cls and not self.infobox and not content_only:
+            self.infobox = self._infobox(node)
+            text = Text("\n").join(
+                Text(" ").join(value for value in (row.label, row.value) if value is not None)
+                for row in self.infobox
+            )
+            if text.plain.strip():
+                out.append(Block("infobox", text, indent=indent,
+                                 anchors=self._node_anchors(node, deep=True)))
+            else:
+                return self._node_anchors(node, deep=True)
+        elif (tag == "table"
+              and not (not content_only and not self._technical_note(cls)
+                       and cls & (NOTE_CLASSES | {"hatnote", "dablink"}))):
+            table = self._table(node)
+            parts = [table.caption] if table.caption.plain else []
+            parts.extend(Text(" | ").join(cell.text for cell in row) for row in table.rows)
+            text = Text("\n").join(parts)
+            if text.plain.strip():
+                out.append(Block("table", text, indent=indent, table=table,
+                                 anchors=self._node_anchors(node, deep=True)))
+            else:
+                return aliases
+        elif not content_only and not self._technical_note(cls) and cls & NOTE_CLASSES:
+            text = self._note_text(node)
+            if text.plain:
+                self.notes.append(text)
+                self._note_blocks.append(Block("hatnote", text, anchors=self._node_anchors(node, deep=True)))
+        elif not content_only and cls & {"hatnote", "dablink"}:
+            text = self.inline(node, boxy=True)
+            if text.plain:
+                text.stylize(Style(italic=True, color=self.pal.muted))
+                block = Block("hatnote", text, anchors=self._node_anchors(node, deep=True), indent=indent)
+                if in_lead and not self._seen_heading:
+                    self.notes.append(text)
+                    self._note_blocks.append(block)
+                else:
+                    out.append(block)
+        else:
+            start = len(out)
+            quote = tag == "blockquote" or bool(cls & {"quotebox", "templatequote"})
+            extra_indent = 4 if quote else (2 if tag == "dd" else 0)
+            remaining = self._walk(node, out, in_lead, indent + extra_indent, list_depth, content_only)
+            for block in out[start:]:
+                if tag == "dt":
+                    block.text.stylize("bold")
+                elif quote and block.kind == "para":
+                    block.kind = "quote"
+                    block.text.stylize("italic")
+                elif tag == "dd" and block.kind == "para":
+                    block.kind = "quote"
+            return remaining
+        return ()
+
+    @staticmethod
+    def _technical_note(cls: set[str]) -> bool:
+        return bool(cls & {"note", "warning", "tip", "important", "caution", "admonition"}
+                    or any(c.startswith("archwiki-template-box") for c in cls))
+
+    def _pre_text(self, node: Node) -> str:
+        parts: list[str] = []
+        for child in node.iter(include_text=True):
+            if child.tag == "-text":
+                parts.append(safe_text(child.text_content or ""))
+            elif not self._skip(child):
+                parts.append("\n" if child.tag == "br" else self._pre_text(child))
+        return "".join(parts)
+
+    def _table(self, node: Node) -> TableData:
+        cap = next((child for child in node.iter() if child.tag == "caption"), None)
+        caption = self.inline(cap, boxy=True) if cap is not None else Text()
+        rows: list[list[TableCell]] = []
+        spans: list[list[int]] = []
+        simple = True
+        for row in self._direct_rows(node):
+            if self._skip(row):
+                continue
+            cells: list[TableCell] = []
+            row_spans: list[int] = []
+            for cell in row.iter():
+                if cell.tag not in ("td", "th") or self._skip(cell):
+                    continue
+                raw_span = cell.attributes.get("colspan", "1") or ""
+                # Bound parsing as well as rendering; large/malformed spans
+                # stay in the source-order fallback without allocating a grid.
+                span = int(raw_span) if (len(raw_span) <= 4 and raw_span.isascii()
+                                         and raw_span.isdecimal()) else 0
+                row_spans.append(span)
+                if (cell.css_first("table") is not None
+                        or cell.attributes.get("rowspan", "1") != "1"
+                        or span < 1):
+                    simple = False
+                parts: list[Block] = []
+                self._walk(cell, parts, in_lead=False, content_only=True)
+                preformatted = any(block.kind == "pre" or
+                                   (block.table is not None and any(c.preformatted for r in block.table.rows for c in r))
+                                   for block in parts)
+                cells.append(TableCell(Text("\n").join(block.text for block in parts),
+                                       cell.tag == "th", preformatted=preformatted))
+            if cells:
+                rows.append(cells)
+                spans.append(row_spans)
+        full_width_rows: set[int] = set()
+        count = max((len(row) for row in rows), default=0)
+        for index, row_spans in enumerate(spans):
+            if len(row_spans) == count and all(span == 1 for span in row_spans):
+                continue
+            if count > 1 and row_spans == [count]:
+                full_width_rows.add(index)
+            else:
+                simple = False
+        return TableData(rows, caption, simple,
+                         frozenset(full_width_rows) if simple else frozenset())
+
+    def _list(self, lst: Node, out: list[Block], depth: int, indent: int = 0,
+              content_only: bool = False) -> tuple[str, ...]:
         ordered = lst.tag == "ol"
         refs = "references" in classes(lst)
-        n = 0
+        start_value = lst.attributes.get("start", "1")
+        try:
+            n = int(start_value) - 1 if len(start_value) < 10 else 0
+        except ValueError:
+            n = 0
+        pending = list(self._node_anchors(lst))
         for li in lst.iter():
-            if li.tag != "li":
+            if li.tag != "li" or self._skip(li):
                 continue
             n += 1
-            t = self.inline(li)
-            if t.plain:
-                if refs:
-                    marker = f"{n}. "
-                else:
-                    marker = f"{n}. " if ordered else ("• " if depth == 0 else "◦ ")
-                bullet = Text(marker, Style(color=self.pal.muted))
-                out.append(Block("ref" if refs else "item", bullet + t, indent=2 + depth * 2, hang=len(marker)))
-            for sub in li.iter():
-                if sub.tag in ("ul", "ol"):
-                    self._list(sub, out, depth + 1)
+            value = li.attributes.get("value")
+            if ordered and value and len(value) < 10:
+                try:
+                    n = int(value)
+                except ValueError:
+                    pass
+            marker = f"{n}. " if ordered or refs else ("• " if depth == 0 else "◦ ")
+            parts: list[Block] = []
+            remaining = self._walk(li, parts, in_lead=False, indent=indent + 2,
+                                   list_depth=depth + 1, content_only=content_only)
+            if not parts:
+                pending.extend(remaining)
+                continue
+            if parts[0].kind != "para":
+                parts.insert(0, Block("para", Text(), indent=indent + 2))
+            first = parts[0]
+            first.kind = "ref" if refs else "item"
+            first.hang = len(marker)
+            first.text = Text(marker, Style(color=self.pal.muted)) + first.text
+            self._add_anchors(first, pending)
+            pending = list(remaining)
+            for block in parts[1:]:
+                if block.kind not in ("item", "ref"):
+                    block.indent += len(marker)
+            out.extend(parts)
+        return tuple(dict.fromkeys(pending))
 
     def _note_text(self, box: Node) -> Text:
         body = box.css_first(".mbox-text") or box
@@ -670,59 +940,94 @@ class Zim:
     def name(self) -> str:
         for k in ("Title", "Name"):
             try:
-                return self.z.get_metadata(k).decode()
+                return safe_text(self.z.get_metadata(k).decode())
             except Exception:
                 pass
-        return self.path
+        return safe_text(self.path)
 
-    def resolve(self, target: str) -> tuple[str, str | None] | None:
-        """Turn an href / path / title into (path, fragment), following redirects."""
+    def resolve(self, target: str, *, base_path: str | None = None,
+                base_href: str | None = None) -> tuple[str, str | None] | None:
+        """Resolve titles/canonical paths, or a local href relative to its article.
+
+        URL navigation uses archive paths only. Title search is deliberately a
+        separate mode so punctuation and titles matching other folders cannot
+        change the meaning of a relative link.
+        """
         target = target.strip()
-        frag = None
-        if "#" in target:
-            target, frag = target.split("#", 1)
-        target = target.removeprefix("./")
-        from urllib.parse import unquote
-        target = unquote(target)
-        for _ in range(5):
+        if not target:
+            return None
+        if base_path is not None:
+            resolved = archive_href(target, base_path, base_href)
+            if resolved is None:
+                return None
+            target, frag = resolved
+            title_lookup = False
+        else:
+            frag = None
+            # Canonical entry names can themselves contain '#', '?' or '%'.
+            if not self.z.has_entry_by_path(target):
+                if self.z.has_entry_by_title(target):
+                    target = self.z.get_entry_by_title(target).path
+                else:
+                    target, separator, fragment = target.partition("#")
+                    frag = fragment if separator else None
+                    target = unquote(target.removeprefix("./"))
+            title_lookup = True
+        seen: set[str] = set()
+        for _ in range(10):
             if not target:
                 return None
             if not self.z.has_entry_by_path(target):
                 alt = target.replace(" ", "_")
                 if self.z.has_entry_by_path(alt):
                     target = alt
-                elif self.z.has_entry_by_title(target):
+                elif title_lookup and self.z.has_entry_by_title(target):
                     target = self.z.get_entry_by_title(target).path
                 else:
                     return None
+            if target in seen:
+                return None
+            seen.add(target)
             e = self.z.get_entry_by_path(target)
             if e.is_redirect:
                 e = e.get_redirect_entry()
                 target = e.path
+                title_lookup = False
                 continue
             item = e.get_item()
-            if item.mimetype != "text/html":
+            if item.mimetype.split(";", 1)[0].strip().lower() not in ("text/html", "application/xhtml+xml"):
                 return None
             if item.size < 1024:  # soft redirect page: <meta http-equiv=refresh>
                 html = bytes(item.content).decode("utf-8", "replace")
-                m = re.search(r"URL='?([^'\"]+)'?", html) if "refresh" in html else None
-                if m:
-                    nt = m.group(1)
-                    if "#" in nt:
-                        nt, frag = nt.split("#", 1)
-                    target = unquote(nt.removeprefix("./"))
+                tree = HTMLParser(html)
+                refresh = next((node for node in tree.css("meta[http-equiv]")
+                                if node.attributes.get("http-equiv", "").lower() == "refresh"), None)
+                content = refresh.attributes.get("content", "") if refresh is not None else ""
+                match = re.search(r"(?:^|;)\s*url\s*=\s*(.*?)\s*$", content, re.I)
+                if match:
+                    href = match.group(1).strip("\"'")
+                    base = tree.css_first("base[href]")
+                    resolved = archive_href(href, target, base.attributes["href"] if base else None)
+                    if resolved is None:
+                        return None
+                    target, redirect_frag = resolved
+                    if redirect_frag is not None:
+                        frag = redirect_frag
+                    title_lookup = False
                     continue
             return target, frag
         return None
 
     def html(self, path: str) -> str:
-        return bytes(self.z.get_entry_by_path(path).get_item().content).decode("utf-8", "replace")
+        item = self.z.get_entry_by_path(path).get_item()
+        _check_article_size(item.size)
+        return bytes(item.content).decode("utf-8", "replace")
 
     def title_of(self, path: str) -> str:
         try:
-            return self.z.get_entry_by_path(path).title
+            return safe_text(self.z.get_entry_by_path(path).title)
         except KeyError:
-            return path
+            return safe_text(path)
 
     def suggest(self, q: str, n: int = 5) -> list[tuple[str, str]]:
         q = q.strip()

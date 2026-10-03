@@ -49,13 +49,19 @@ def serve(zim_path: str) -> None:
             if latest is None and eof:
                 return
             msg, latest = latest, None
+        response = {"id": msg.get("id"), "q": msg.get("q"), "results": []}
         try:
             res = zim.suggest(msg.get("q", ""), int(msg.get("n", 5)))
-        except Exception as e:  # never die on one bad query
+        except Exception:  # never serialize error text (it can include the query)
             res = []
-            print(json.dumps({"id": msg.get("id"), "error": repr(e)}), file=sys.stderr, flush=True)
-        print(json.dumps({"id": msg.get("id"), "q": msg.get("q"), "results": res}), file=out, flush=True)
+            response["error"] = "search_failed"
+        response["results"] = res
+        print(json.dumps(response), file=out, flush=True)
 
 
 if __name__ == "__main__":
-    serve(sys.argv[1])
+    try:
+        serve(sys.argv[1])
+    except Exception:
+        # The parent handles process failure; never write raw traceback content.
+        raise SystemExit(1) from None

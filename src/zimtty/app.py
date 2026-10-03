@@ -2,13 +2,19 @@
 Wikipedia and other wikis), themed from the active Omarchy theme."""
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote
+
+from .diagnostics import DiagnosticTrace, Event, disable_framework_logging
+
+disable_framework_logging()
 
 from rich.style import Style
 from rich.text import Text
@@ -22,7 +28,8 @@ from textual.widgets.option_list import Option
 
 from . import theme as omatheme
 from .paginate import Layout, Page, Paginator
-from .zimdoc import Article, ArticleParser, Zim
+from .safety import safe_text
+from .zimdoc import Article, ArticleParser, Zim, local_href
 
 # Textual abandons an escape sequence after 32 chars and "reissues" it as typed
 # keys. With the kitty keyboard protocol, foot delivers text produced by the
@@ -44,6 +51,8 @@ TEXT_MAX = 88  # comfortable reading measure
 class Place:
     path: str
     block: int = 0
+    page_offset: int = 0  # continuation page within a code/table/prose block
+    breaks: frozenset[int] = frozenset()
 
 
 # ------------------------------------------------------------------ widgets
@@ -96,7 +105,7 @@ class SearchBar(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Input(placeholder="search titles…", id="search-input")
-        yield OptionList(id="search-results")
+        yield OptionList(id="search-results", markup=False)
 
 
 class HelpPanel(Static):
@@ -123,9 +132,14 @@ class PageView(Horizontal):
     """
 
     def compose(self) -> ComposeResult:
-        yield Static(id="text")
+        yield Static(id="text", markup=False)
         yield Static(id="gutter")
-        yield Static(id="info")
+        yield Static(id="info", markup=False)
+
+    def on_resize(self, event: Resize) -> None:
+        # App resize events arrive before this container has its new geometry.
+        # Widget Resize events do not bubble, so forward the completed layout.
+        self.app._queue_reader_resize()
 
 
 class StatusBar(Horizontal):
@@ -136,8 +150,8 @@ class StatusBar(Horizontal):
     """
 
     def compose(self) -> ComposeResult:
-        yield Static(id="st-left")
-        yield Static(id="st-right")
+        yield Static(id="st-left", markup=False)
+        yield Static(id="st-right", markup=False)
 
 
 # ------------------------------------------------------------------ app
@@ -171,11 +185,17 @@ class ZimTTY(App):
         Binding("question_mark", "help", "help", show=False),
     ]
 
-    def __init__(self, zim: Zim, start: str | None):
+    def __init__(self, zim: Zim, start: str | None, trace: DiagnosticTrace | None = None):
+        disable_framework_logging()
         super().__init__()
+        self.diagnostics = trace if trace is not None else DiagnosticTrace()
         self.zim = zim
         self.start = start
-        self.pal, self._theme = omatheme.build(omatheme.read_colors())
+        try:
+            self.pal, self._theme = omatheme.build(omatheme.read_colors(strict=True))
+        except omatheme.ThemeError as error:
+            self.diagnostics.record(Event.THEME_INVALID, error)
+            self.pal, self._theme = omatheme.build(omatheme.FALLBACK)
         self._theme_mtime = omatheme.colors_mtime()
         self.show_refs = False
         self.article: Article | None = None
@@ -195,6 +215,19 @@ class ZimTTY(App):
         self.link_sel: int | None = None  # n/N: index into this page's link targets
         self._help_timer = None
 
+    def _handle_exception(self, error: Exception) -> None:
+        # Textual's default traceback shows locals, which can contain queries
+        # and whole articles. Keep its failure/test signaling but not rendering.
+        self._return_code = 1
+        if self._exception is None:
+            self._exception = error
+            self._exception_event.set()
+        self.diagnostics.record(Event.INTERNAL_ERROR, error)
+        self._exit_renderables.append(Text(
+            "zimtty: internal error; use --diagnostics for a short trace."
+        ))
+        self._close_messages_no_wait()
+
     # -------------------------------------------------------------- layout
 
     def compose(self) -> ComposeResult:
@@ -211,15 +244,13 @@ class ZimTTY(App):
         self.query_one(TocPanel).border_title = "contents"
         self.set_interval(2.0, self._check_theme)
         self.run_worker(self._start_suggestd(), group="suggestd")
-        if self.start:
-            self.open(self.start)
-        else:
+        if not self.start or not self.open(self.start):
             self._splash()
 
     def _splash(self):
         n = self.zim.z.article_count
         t = Text.assemble(
-            (self.zim.name + "\n", Style(bold=True, color=self.pal.heading)),
+            (safe_text(self.zim.name) + "\n", Style(bold=True, color=self.pal.heading)),
             (f"{n:,} articles, fully offline\n\n", Style(color=self.pal.muted)),
             ("/", Style(bold=True, color=self.pal.accent)), (" search    ", Style(color=self.pal.muted)),
             ("R", Style(bold=True, color=self.pal.accent)), (" random    ", Style(color=self.pal.muted)),
@@ -235,8 +266,9 @@ class ZimTTY(App):
 
     def _layout(self) -> Layout:
         pv = self.query_one(PageView)
-        W = max(pv.size.width - 4, 20)  # minus horizontal padding
-        H = max(pv.size.height - 1, 6)  # minus top padding
+        # Textual's content size already excludes the container's padding.
+        W = max(pv.content_size.width, 20)
+        H = max(pv.content_size.height, 6)
         if W >= INFO_MIN_TOTAL:
             info = INFO_W
             narrow = min(TEXT_MAX, W - (info + 4) - 3)
@@ -244,69 +276,135 @@ class ZimTTY(App):
             info, narrow = 0, min(TEXT_MAX, W)
         return Layout(height=H, full_width=min(TEXT_MAX, W), narrow_width=narrow, info_width=info)
 
-    def on_resize(self, event: Resize) -> None:
-        if self.article:
-            self.call_after_refresh(self._repaginate)
+    def _queue_reader_resize(self) -> None:
+        if getattr(self, "_reader_resize_pending", False):
+            return
+        self._reader_resize_pending = True
+        self.call_after_refresh(self._repaginate_after_resize)
+
+    def _repaginate_after_resize(self) -> None:
+        self._reader_resize_pending = False
+        if not self.article:
+            return
+        layout = self._layout()
+        if layout == getattr(self, "_reader_resize_layout", None):
+            return
+        self._reader_resize_layout = layout
+        self._repaginate()
 
     # -------------------------------------------------------------- navigation
 
-    def open(self, target: str, push: bool = True, block: int | None = None) -> bool:
-        res = self.zim.resolve(target)
-        if not res:
-            self.notify(f"not in this ZIM: {target}", severity="warning", timeout=3)
+    def open(self, target: str, push: bool = True, block: int | None = None,
+             *, relative: bool = False, page_offset: int = 0,
+             page_breaks: frozenset[int] | None = None) -> bool:
+        # Prepare the entire document before replacing the current reading state.
+        # Archive read/parse errors must not leave new content with old pages.
+        try:
+            if relative and self.article is not None:
+                res = self.zim.resolve(target, base_path=self.article.path,
+                                       base_href=self.article.base_href)
+            else:
+                res = self.zim.resolve(target)
+            if not res:
+                self.notify(safe_text(f"not in this ZIM: {target}")[:300],
+                            severity="warning", timeout=3, markup=False)
+                return False
+            path, frag = res
+            article = self._read_article(path)
+            if block is None:
+                block = self._anchor_block(frag, article) if frag else 0
+            block = max(0, min(block, len(article.blocks) - 1))
+            if page_breaks is not None:
+                breaks = set(page_breaks)
+            else:
+                breaks = {block} if block and article.blocks[block].kind != "infobox" else set()
+            pages = Paginator(self.pal).paginate(article, self._layout(), breaks)
+        except (OSError, RuntimeError, ValueError, KeyError) as error:
+            # Includes bounded-parser ArticleError and defensive RecursionError.
+            self._article_error(error)
             return False
-        path, frag = res
         if push:
             self._remember()  # must happen before the new article replaces self.pages
-        self._load(path)
-        if block is None:
-            block = self._anchor_block(frag) if frag else 0
-        if block:
-            if self.article.blocks[block].kind in ("h2", "h3", "h4"):
-                self.breaks.add(block)
-        self._repaginate(anchor_block=block)
+        self.article = article
+        self.breaks = breaks
+        self._fill_toc()
+        self._set_pages(pages, block, page_offset)
         if push:
             del self.history[self.hist_i + 1:]
-            self.history.append(Place(path, block))
+            self.history.append(self._current_place())
             self.hist_i = len(self.history) - 1
         return True
 
-    def _load(self, path: str):
-        html = self.zim.html(path)
-        self.article = ArticleParser(self.pal, self.show_refs, links=not self.plain_links).parse(path, html)
-        self.breaks = set()
-        self.hints = None
-        self.link_sel = None
-        self._fill_toc()
+    def _article_error(self, error: Exception) -> None:
+        self.diagnostics.record(Event.ARTICLE_READ_FAILED, error)
+        self.notify(safe_text(f"could not open article: {error}")[:300],
+                    severity="error", timeout=5, markup=False)
 
-    def _anchor_block(self, frag: str | None) -> int:
-        if not frag or not self.article:
+    def _read_article(self, path: str) -> Article:
+        html = self.zim.html(path)
+        return ArticleParser(self.pal, self.show_refs, links=not self.plain_links).parse(path, html)
+
+    def _anchor_block(self, frag: str | None, article: Article | None = None) -> int:
+        article = article if article is not None else self.article
+        if not frag or not article:
             return 0
-        frag = unquote(frag)
-        for i, b in enumerate(self.article.blocks):
-            if b.anchor and (b.anchor == frag or b.anchor == frag.replace(" ", "_")):
-                return i
+        for candidate in self._anchor_candidates(frag):
+            if candidate in article.anchors:
+                return article.anchors[candidate]
+            # Retain support for programmatically constructed Articles.
+            for i, b in enumerate(article.blocks):
+                if b.anchor == candidate:
+                    return i
         return 0
+
+    @staticmethod
+    def _anchor_candidates(frag: str) -> list[str]:
+        decoded = unquote(frag)
+        # Older MediaWiki URLs encode UTF-8 fragment bytes as .XX instead of %XX.
+        legacy = unquote(re.sub(r"\.([0-9A-Fa-f]{2})", r"%\1", decoded))
+        return list(dict.fromkeys((frag, decoded, decoded.replace(" ", "_"),
+                                   legacy, legacy.replace(" ", "_"))))
 
     def _remember(self):
         """Store the current block in the current history entry before leaving it."""
         if 0 <= self.hist_i < len(self.history) and self.pages:
-            self.history[self.hist_i].block = self.pages[self.page_i].first_block
+            self.history[self.hist_i] = self._current_place()
+
+    @staticmethod
+    def _block_pages(pages: list[Page], block: int) -> list[int]:
+        return [i for i, page in enumerate(pages)
+                if block in page.blocks or page.first_block == block]
+
+    def _current_place(self) -> Place:
+        block = self.pages[self.page_i].first_block if self.pages else 0
+        candidates = self._block_pages(self.pages, block)
+        offset = candidates.index(self.page_i) if self.page_i in candidates else 0
+        return Place(self.article.path, block, offset, frozenset(self.breaks))
 
     def _repaginate(self, anchor_block: int | None = None):
         if not self.article:
             return
+        page_offset = 0
         if anchor_block is None:
-            anchor_block = self.pages[self.page_i].first_block if self.pages else 0
-        lay = self._layout()
-        self.link_sel = None  # line/column positions change with the layout
-        self.pages = Paginator(self.pal).paginate(self.article, lay, self.breaks)
-        self.page_i = 0
-        for i, p in enumerate(self.pages):
-            if p.first_block <= anchor_block:
-                self.page_i = i
-            else:
-                break
+            place = self._current_place()
+            anchor_block, page_offset = place.block, place.page_offset
+        try:
+            pages = Paginator(self.pal).paginate(self.article, self._layout(), self.breaks)
+        except (RuntimeError, ValueError) as error:
+            self._article_error(error)
+            return
+        self._set_pages(pages, anchor_block, page_offset)
+
+    def _set_pages(self, pages: list[Page], anchor_block: int, page_offset: int = 0) -> None:
+        self.pages = pages
+        # Line/column positions change whenever pages are rebuilt.
+        self.link_sel = None
+        self.hints = None
+        self.hint_buf = ""
+        # A code block/table can occupy many pages. An anchor names its start,
+        # not its last continuation page.
+        candidates = self._block_pages(pages, anchor_block)
+        self.page_i = candidates[min(max(page_offset, 0), len(candidates) - 1)] if candidates else 0
         self._show()
 
     def _show(self):
@@ -343,7 +441,7 @@ class ZimTTY(App):
         left = self.query_one("#st-left", Static)
         right = self.query_one("#st-right", Static)
         if not self.article:
-            left.update(self.zim.name)
+            left.update(Text(safe_text(self.zim.name)))
             right.update("")
             return
         a = self.article
@@ -352,9 +450,9 @@ class ZimTTY(App):
         for e in a.toc:
             if e.block <= fb and e.level == 2:
                 sec = e.title
-        l = Text(a.title, Style(color=self.pal.fg))
+        l = Text(safe_text(a.title), Style(color=self.pal.fg))
         if sec:
-            l.append(f"  ›  {sec}", Style(color=self.pal.muted))
+            l.append(f"  ›  {safe_text(sec)}", Style(color=self.pal.muted))
         left.update(l)
         r = Text()
         if self.hints is not None:
@@ -393,29 +491,44 @@ class ZimTTY(App):
         self._show()
 
     def action_back(self):
-        if self.hist_i > 0:
-            self._remember()
-            self.hist_i -= 1
-            p = self.history[self.hist_i]
-            self.open(p.path, push=False, block=p.block)
+        self._visit_history(self.hist_i - 1)
 
     def action_forward(self):
-        if self.hist_i < len(self.history) - 1:
-            self._remember()
-            self.hist_i += 1
-            p = self.history[self.hist_i]
-            self.open(p.path, push=False, block=p.block)
+        self._visit_history(self.hist_i + 1)
+
+    def _visit_history(self, index: int) -> None:
+        if not (0 <= index < len(self.history)):
+            return
+        previous = self._current_place()
+        p = self.history[index]
+        if self.open(p.path, push=False, block=p.block, page_offset=p.page_offset, page_breaks=p.breaks):
+            self.history[self.hist_i] = previous
+            self.hist_i = index
 
     def action_follow(self, href: str):
-        if href.startswith("#"):
-            b = self._anchor_block(href[1:])
-            if b:
-                self.jump_block(b)
+        if self.plain_links or not local_href(href):
             return
-        self.open(href)
+        if href.startswith("#"):
+            if self.article is not None:
+                frag = href[1:]
+                b = self._anchor_block(frag)
+                known = not frag or b != 0 or any(
+                    key in self.article.anchors for key in self._anchor_candidates(frag)
+                )
+                if known:
+                    self.open(self.article.path, block=b)
+                else:
+                    self.notify("section not found in this article", timeout=2)
+            return
+        self.open(href, relative=True)
 
     def action_random(self):
-        self.open(self.zim.random_path())
+        try:
+            path = self.zim.random_path()
+        except (OSError, RuntimeError, ValueError, KeyError) as error:
+            self._article_error(error)
+            return
+        self.open(path)
 
     def action_notes(self):
         if not self.article:
@@ -426,18 +539,26 @@ class ZimTTY(App):
                 return
         self.notify("no additional notes on this article", timeout=2)
 
-    def _reload_keep_place(self):
+    def _reload_keep_place(self) -> bool:
         """Re-parse the current article (after a display toggle), same page."""
         if self.article:
-            anchor = self.pages[self.page_i].first_block if self.pages else 0
-            brk = self.breaks
-            self._load(self.article.path)
-            self.breaks = brk
-            self._repaginate(anchor_block=anchor)
+            place = self._current_place()
+            try:
+                article = self._read_article(self.article.path)
+                pages = Paginator(self.pal).paginate(article, self._layout(), self.breaks)
+            except (OSError, RuntimeError, ValueError, KeyError) as error:
+                self._article_error(error)
+                return False
+            self.article = article
+            self._fill_toc()
+            self._set_pages(pages, place.block, place.page_offset)
+        return True
 
     def action_toggle_refs(self):
         self.show_refs = not self.show_refs
-        self._reload_keep_place()
+        if not self._reload_keep_place():
+            self.show_refs = not self.show_refs
+            return
         self.notify(f"citation markers {'on' if self.show_refs else 'off'}", timeout=1.5)
 
     def action_toggle_links(self):
@@ -445,8 +566,9 @@ class ZimTTY(App):
             self._toc_key("l")  # in the contents panel, l means "open subsection"
             return
         self.plain_links = not self.plain_links
-        self.link_sel = None
-        self._reload_keep_place()
+        if not self._reload_keep_place():
+            self.plain_links = not self.plain_links
+            return
         self._status()
         self.notify("links off: plain text, not followable" if self.plain_links else "links on",
                     timeout=1.5)
@@ -493,9 +615,17 @@ class ZimTTY(App):
         lines is ONE target: ([(line, start, end), ...], href)."""
         if not self.pages or self.plain_links:
             return []
-        runs = self._page_links(self.pages[self.page_i].lines)
+        runs = self._link_runs(self.pages[self.page_i].lines)
         out: list[tuple[list[tuple[int, int, int]], str]] = []
-        for li, start, end, href in runs:
+        identities: dict[int, int] = {}
+        for li, start, end, href, identity in runs:
+            if identity is not None:
+                if identity in identities:
+                    out[identities[identity]][0].append((li, start, end))
+                else:
+                    identities[identity] = len(out)
+                    out.append(([(li, start, end)], href))
+                continue
             prev = out[-1] if out else None
             if prev and prev[1] == href and prev[0][-1][0] == li - 1 and start == 0:
                 prev[0].append((li, start, end))  # continuation of a wrapped link
@@ -505,8 +635,8 @@ class ZimTTY(App):
 
     def _href_title(self, href: str) -> str:
         if href.startswith("#"):
-            return "§ " + href[1:].replace("_", " ")
-        return unquote(href.split("#", 1)[0].removeprefix("./")).replace("_", " ")
+            return "§ " + safe_text(unquote(href[1:])).replace("_", " ")
+        return safe_text(unquote(href.split("#", 1)[0].removeprefix("./"))).replace("_", " ")
 
     def action_link_step(self, delta: int):
         if self.plain_links:
@@ -565,7 +695,7 @@ class ZimTTY(App):
         return out
 
     def jump_block(self, block: int):
-        if self.article.blocks[block].kind in ("h2", "h3", "h4"):
+        if block and self.article.blocks[block].kind != "infobox":
             self.breaks.add(block)
         self._repaginate(anchor_block=block)
 
@@ -578,7 +708,7 @@ class ZimTTY(App):
         for e in self.article.toc:
             while stack[-1][0] >= e.level:
                 stack.pop()
-            node = stack[-1][1].add(e.title, data=e.block, expand=False)
+            node = stack[-1][1].add(Text(safe_text(e.title)), data=e.block, expand=False)
             stack.append((e.level, node))
         for n in list(tree.root.children):
             if not n.children:
@@ -684,24 +814,54 @@ class ZimTTY(App):
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL, limit=1 << 20,
             )
-        except OSError:
+        except OSError as error:
+            self.diagnostics.record(Event.SEARCH_START_FAILED, error)
             self._sugg_proc = None
             return
         self.run_worker(self._read_suggestd(), exclusive=False, group="suggestd")
 
     async def _read_suggestd(self):
         proc = self._sugg_proc
-        while proc and proc.stdout:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            if "results" in msg:
-                self._show_results(msg["q"], [tuple(r) for r in msg["results"]])
-        self._sugg_proc = None  # died: fall back to in-process queries
+        if proc is None:
+            return
+        try:
+            while proc.stdout:
+                try:
+                    line = await proc.stdout.readline()
+                except (OSError, ValueError) as error:
+                    # Oversized archive titles can exceed the JSON line limit.
+                    # A broken suggestion pipe must not terminate the reader UI.
+                    self.diagnostics.record(Event.SEARCH_PIPE_FAILED, error)
+                    break
+                if not line:
+                    break
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    self.diagnostics.record(Event.SEARCH_PIPE_FAILED)
+                    continue
+                if not isinstance(msg, dict):
+                    self.diagnostics.record(Event.SEARCH_PIPE_FAILED)
+                    continue
+                if msg.get("error") == "search_failed":
+                    self.diagnostics.record(Event.SEARCH_QUERY_FAILED)
+                if "results" in msg:
+                    results = msg["results"]
+                    if (not isinstance(msg.get("q"), str) or not isinstance(results, list)
+                            or not all(isinstance(r, list) and len(r) == 2
+                                       and all(isinstance(s, str) for s in r) for r in results)):
+                        self.diagnostics.record(Event.SEARCH_PIPE_FAILED)
+                        continue
+                    self._show_results(msg["q"], [tuple(r) for r in results])
+        finally:
+            if self._sugg_proc is proc:
+                self._sugg_proc = None  # next query falls back to in-process search
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass  # exited between the returncode check and kill
+            await proc.wait()
 
     def _send_query(self, q: str):
         proc = self._sugg_proc
@@ -711,19 +871,30 @@ class ZimTTY(App):
         self._query_id += 1
         try:
             proc.stdin.write((json.dumps({"id": self._query_id, "q": q}) + "\n").encode())
-        except (BrokenPipeError, ConnectionResetError, RuntimeError):
+        except (BrokenPipeError, ConnectionResetError, RuntimeError) as error:
+            self.diagnostics.record(Event.SEARCH_PIPE_FAILED, error)
             self._sugg_proc = None
             self._suggest_inprocess(q)
 
     @work(thread=True, exclusive=True)
     def _suggest_inprocess(self, q: str):
-        res = self.zim.suggest(q, 5)
+        try:
+            res = self.zim.suggest(q, 5)
+        except (OSError, RuntimeError, ValueError, KeyError) as error:
+            self.diagnostics.record(Event.SEARCH_QUERY_FAILED, error)
+            res = []
         self.call_from_thread(self._show_results, q, res)
 
     async def on_unmount(self) -> None:
         proc = getattr(self, "_sugg_proc", None)
-        if proc is not None and proc.returncode is None:
-            proc.kill()
+        if proc is not None:
+            self._sugg_proc = None
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            await proc.wait()
 
     def _show_results(self, q: str, res: list[tuple[str, str]]):
         if self.query_one("#search-input", Input).value != q:
@@ -740,7 +911,7 @@ class ZimTTY(App):
         ol = self.query_one("#search-results", OptionList)
         ol.clear_options()
         for path, title in res:
-            ol.add_option(Option(title, id=path))
+            ol.add_option(Option(Text(safe_text(title)), id=path))
         self._results_for = q
         if res:
             ol.highlighted = 0
@@ -770,6 +941,11 @@ class ZimTTY(App):
 
     def _page_links(self, lines: list[Text]) -> list[tuple[int, int, int, str]]:
         """(line, start, end, href) for each link run on the page."""
+        return [run[:4] for run in self._link_runs(lines)]
+
+    @staticmethod
+    def _link_runs(lines: list[Text]) -> list[tuple[int, int, int, str, int | None]]:
+        """Retain each source link's identity through wrapping and table columns."""
         out = []
         for li, line in enumerate(lines):
             runs: list[list] = []
@@ -778,10 +954,12 @@ class ZimTTY(App):
                 href = st.meta.get("href") if isinstance(st, Style) and st.meta else None
                 if not href:
                     continue
-                if runs and runs[-1][3] == href and sp.start <= runs[-1][2] + 1:
+                identity = st.meta.get("link_id")
+                if (runs and runs[-1][3:] == [href, identity]
+                        and sp.start <= runs[-1][2]):
                     runs[-1][2] = max(runs[-1][2], sp.end)
                 else:
-                    runs.append([li, sp.start, sp.end, href])
+                    runs.append([li, sp.start, sp.end, href, identity])
             out.extend(tuple(r) for r in runs)
         return out
 
@@ -798,7 +976,8 @@ class ZimTTY(App):
         if self.plain_links:
             self.notify("links are off, press l to turn them back on", timeout=2)
             return
-        links = self._page_links(self.pages[self.page_i].lines)
+        links = [(runs[0][0], runs[0][1], runs[0][2], href)
+                 for runs, href in self._link_targets()]
         if not links:
             self.notify("no links on this page", timeout=1.5)
             return
@@ -819,9 +998,14 @@ class ZimTTY(App):
                 out.append(line)
                 continue
             new = line.copy()
-            for start, lab in sorted(by_line[li]):
+            # Work right-to-left because a wide character may require padding
+            # after replacing it with an ASCII hint, changing string offsets.
+            for start, lab in sorted(by_line[li], reverse=True):
                 end = min(start + len(lab), len(new.plain))
-                new = new[:start] + Text(lab[: end - start], tag) + new[end:]
+                cells = new[start:end].cell_len
+                label = lab[:min(end - start, cells)]
+                replacement = Text(label + " " * max(0, cells - len(label)), tag)
+                new = new[:start] + replacement + new[end:]
             out.append(new)
         return out
 
@@ -884,7 +1068,13 @@ class ZimTTY(App):
         if m == self._theme_mtime:
             return
         self._theme_mtime = m
-        self.pal, self._theme = omatheme.build(omatheme.read_colors())
+        try:
+            pal, theme = omatheme.build(omatheme.read_colors(strict=True))
+        except omatheme.ThemeError as error:
+            self.diagnostics.record(Event.THEME_INVALID, error)
+            self.notify("Theme update ignored: invalid colors.", severity="warning", timeout=3)
+            return
+        self.pal, self._theme = pal, theme
         self.register_theme(self._theme)
         self.theme = "omarchy"
         self.refresh_css()
@@ -912,10 +1102,41 @@ def find_zim(arg: str | None) -> str:
     sys.exit("zimtty: no readable .zim found (pass a path, set ZIMTTY_ZIM, or put one in ~/Downloads/zim)")
 
 
+class _Arguments(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse otherwise echoes unknown options, which may be private input.
+        super().error("invalid arguments; use --help")
+
+
 def main():
-    args = sys.argv[1:]
-    zim_arg = next((a for a in args if a.endswith(".zim")), None)
-    rest = [a for a in args if a is not zim_arg]
+    parser = _Arguments(prog="zimtty", description="Offline terminal reader for ZIM files.")
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="print up to 32 private event codes on exit; no log file")
+    parser.add_argument("targets", nargs="*", metavar="ZIM_OR_TITLE",
+                        help="optional .zim path and article title (use -- before titles starting with -)")
+    args = parser.parse_intermixed_args()
+    zim_arg = next((a for a in args.targets if a.endswith(".zim")), None)
+    rest = list(args.targets)
+    if zim_arg is not None:
+        rest.remove(zim_arg)
     start = " ".join(rest) or None
-    zim = Zim(find_zim(zim_arg))
-    ZimTTY(zim, start).run()
+    trace = DiagnosticTrace()
+    trace.record(Event.SESSION_STARTED)
+    app = None
+    try:
+        zim = Zim(find_zim(zim_arg))
+        app = ZimTTY(zim, start, trace=trace)
+        app.run()
+        if app.return_code:
+            raise SystemExit(app.return_code)
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+    except Exception as error:
+        trace.record(Event.STARTUP_FAILED if app is None else Event.INTERNAL_ERROR, error)
+        print("zimtty: could not run the reader; use --diagnostics for a short trace.", file=sys.stderr)
+        raise SystemExit(1) from None
+    finally:
+        trace.record(Event.SESSION_STOPPED)
+        if args.diagnostics:
+            print(trace.render(), file=sys.stderr)
+        trace.clear()
