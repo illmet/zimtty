@@ -1,18 +1,33 @@
 # zimtty
 
-A keyboard-first terminal reader for ZIM files: offline Wikipedia and other wikis.
-It shows articles one screen-sized page at a time rather than as a scrolling web page,
-with the infobox in its own box on the right, and takes its colours from the active
-Omarchy theme.
+zimtty is a keyboard-first terminal reader for local ZIM archives, including
+offline Wikipedia and ArchWiki. Search article titles, browse a contents panel,
+follow internal links and section anchors, and move through reading history
+without leaving the terminal. Articles appear one screen-sized page at a time,
+with headings kept beside their text and infoboxes shown alongside the article
+or inline on narrower screens. 
 
-    uv run zimtty                       # picks the largest readable .zim in ~/Downloads/zim
+The reader preserves code indentation, lists, captions, and technical warnings.
+Simple tables use aligned columns with repeating headers and full-width titles
+or notes; cramped, irregular, and complex merged tables fall back to readable
+rows of text. Long code lines fold to fit, and article text and tables use up to
+88 columns. Wikipedia `nopic` and English ArchWiki archives have integration
+coverage; other text-based wikis may need adjustments for their particular HTML.
+The minimum supported terminal size is 24 columns by 8 rows.
+
+Reading stays offline, and the app writes no usage history.
+Optional `--diagnostics` prints a short trace on exit containing only the last
+32 event codes, timings, and limited code locations, excluding typed input,
+article text, paths, and exception messages. Verbose framework logging and
+automatic screenshots are disabled. Redirecting diagnostics to a file or using
+terminal recording can still leave a record outside the app.
+
+    uv run zimtty                       # largest readable .zim in ~/Downloads/zim
     uv run zimtty "Max Weber"           # open an article directly
-    uv run zimtty path/to/file.zim      # or set ZIMTTY_ZIM
+    uv run zimtty path/to/file.zim      # choose an archive, or set ZIMTTY_ZIM
+    uv run zimtty --diagnostics         # print the short trace after exiting
 
-Works best with Wikipedia `nopic` ZIMs (both the current `<section>` HTML and the
-older flat HTML of e.g. the July 2025 English build). Other MediaWiki-based ZIMs
-(Wiktionary, distro wikis) open and read fine. Non-MediaWiki ZIMs such as
-Gutenberg (EPUB-based) or Stack Exchange aren't supported yet.
+    alias wiki='uv run --offline --no-sync --project /path-to/zimtty zimtty'
 
 ## Keys
 
@@ -30,30 +45,37 @@ Gutenberg (EPUB-based) or Stack Exchange aren't supported yet.
     ?                            key help (press ? again or esc to close)
     q / esc                      quit / close panel
 
-## Layout rules
-
-Whole paragraphs per page (oversized ones split at sentence boundaries), headings
-kept with their text, every top-level section starts a new page, infobox in its own
-box on the right (continues across pages; text goes full width once it ends).
-Colours come from `~/.local/state/omarchy/current/theme/colors.toml` and live-reload
-when the theme changes.
-
 ## Code
 
-    src/zimtty/zimdoc.py     ZIM access + HTML -> blocks / infobox / TOC (+ TeX -> text)
-    src/zimtty/paginate.py   blocks -> screen pages
-    src/zimtty/theme.py      Omarchy colors.toml -> palette + Textual theme
-    src/zimtty/suggestd.py   title-search subprocess (libzim holds the GIL)
-    src/zimtty/app.py        the Textual app
-    tests/                   pytest: unit, real-ZIM, and headless UI tests
-    tools/                   diagnostics: render, probe, ibox_raw, keylog, gil_probe
+    src/zimtty/zimdoc.py      ZIM access + HTML -> blocks / infobox / TOC (+ TeX -> text)
+    src/zimtty/paginate.py    blocks -> screen pages
+    src/zimtty/theme.py       Omarchy colors.toml -> palette + Textual theme
+    src/zimtty/safety.py      terminal-control filtering for archive display text
+    src/zimtty/diagnostics.py bounded event codes without input or document text
+    src/zimtty/suggestd.py    title-search subprocess (libzim holds the GIL)
+    src/zimtty/app.py         the Textual app
+    tests/                   unit, real-ZIM, and headless UI tests
+    tools/                   render, probe, ibox_raw, keylog, gil_probe
+
+Developer tools may display archive contents. `tools/keylog.py [kitty]` reports
+input event sizes and escape-sequence presence without recording raw keys.
 
 ## Tests
 
-    uv run pytest                 # everything (~1.5 min)
+    uv run pytest                     # everything, including optional local archives
     uv run pytest tests/test_unit.py   # no ZIM files needed, instant
+    uv run pytest tests/test_security_*.py tests/test_suggestd_recovery.py  # no ZIM files needed
 
 Tests that need real ZIMs look in `~/Downloads/zim` (or `$ZIMTTY_TEST_ZIM_DIR`) and
-are skipped if the files are missing: `wikipedia_en_sociology_nopic_*.zim` (small,
-new-style HTML), `wikipedia_en_all_nopic_*.zim` (full, old-style HTML), and any
-ZIMs in `other/`.
+are skipped if the files are missing: `wikipedia_en_all_nopic_*.zim` and
+`archlinux_en_all_maxi_*.zim`. Archive samples use seeded entry selection for
+repeatability within a particular ZIM. Synthetic fixtures cover flat and
+section-based HTML, code, tables, links, and malformed input without downloads.
+
+## Theme sync
+
+On Omarchy, colours follow the active theme through
+`~/.local/state/omarchy/current/theme/colors.toml` and update while the reader is
+running. Outside Omarchy, or when that file is missing, a built-in palette is used.
+An invalid theme at startup also uses the default palette; an invalid live edit
+keeps the last working theme until a valid update is available.
