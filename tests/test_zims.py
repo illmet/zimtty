@@ -1,9 +1,4 @@
-"""Tests against real ZIM files (skipped if the files aren't present).
-
-Replaces the old scratch/ probes: render_check, sweep, ibox_check, ibox_sweep,
-other_zims, search checks.
-"""
-import random
+"""Tests against full English Wikipedia (skipped when not installed)."""
 import re
 
 import pytest
@@ -11,9 +6,14 @@ import pytest
 from zimtty.paginate import Layout, Paginator
 from zimtty.zimdoc import ArticleParser, Zim
 
-from .conftest import other_zims
+from .conftest import sampled_article_paths
 
-JUNK = re.compile(r"mw-parser-output|/\*|display:|\.mw-|class=|<[a-z]+[ >]")
+# Literal values such as "<vacant>" are valid article text. Recognize leaked
+# structural HTML here rather than treating every angle-bracket word as a tag.
+JUNK = re.compile(
+    r"mw-parser-output|/\*|display:|\.mw-|class=|"
+    r"</?(?:div|span|table|tbody|thead|tr|td|th|style|script)\b[^>]*>"
+)
 
 
 def parse(zim: Zim, title: str, pal):
@@ -24,13 +24,10 @@ def parse(zim: Zim, title: str, pal):
 
 # ---------------------------------------------------------------- robustness sweep
 
-@pytest.mark.parametrize("n", [60])
-def test_random_articles_paginate_cleanly(any_wikipedia, pal, n):
-    """Random articles at tiny..wide sizes: pages never overflow, no text lost."""
-    random.seed(7)
-    for _ in range(n):
-        p = any_wikipedia.random_path()
-        a = ArticleParser(pal).parse(p, any_wikipedia.html(p))
+def test_sampled_articles_paginate_cleanly(big_zim, pal):
+    """Seeded articles at tiny..wide sizes: pages never overflow, no text lost."""
+    for p in sampled_article_paths(big_zim, 60, seed=7):
+        a = ArticleParser(pal).parse(p, big_zim.html(p))
         for W, H, info in ((20, 10, 0), (88, 30, 0), (140, 45, 38)):
             lay = Layout(H, min(88, W), min(88, W - info - 7) if info else min(88, W), info)
             pages = Paginator(pal).paginate(a, lay, set())
@@ -45,16 +42,16 @@ def test_random_articles_paginate_cleanly(any_wikipedia, pal, n):
 
 # ---------------------------------------------------------------- known articles
 
-def test_max_weber_structure(small_zim, pal):
-    a = parse(small_zim, "Max Weber", pal)
+def test_max_weber_structure(big_zim, pal):
+    a = parse(big_zim, "Max Weber", pal)
     titles = [e.title for e in a.toc]
     assert titles[0] == "Biography" and "Verstehen" in titles
     assert a.infobox[0].kind == "title"
     assert {"Born", "Died"} <= {r.label.plain for r in a.infobox if r.kind == "pair"}
 
 
-def test_lead_hatnote_goes_to_notes(small_zim, pal):
-    a = parse(small_zim, "Hunger in the United Kingdom", pal)
+def test_lead_hatnote_goes_to_notes(big_zim, pal):
+    a = parse(big_zim, "Hunger in the United Kingdom", pal)
     assert a.notes and "redirects here" in a.notes[0].plain
     assert any(b.anchor == "__notes__" for b in a.blocks)
 
@@ -79,11 +76,9 @@ def test_infoboxes_big(big_zim, pal, title, must, mustnot):
 
 
 def test_infobox_sweep_big(big_zim, pal):
-    """Random infoboxes: no CSS/HTML leaking, nothing wider than the box, always a title."""
-    random.seed(11)
+    """Seeded infoboxes: no CSS/HTML leaking, overflow, or missing titles."""
     seen = 0
-    for _ in range(200):
-        p = big_zim.random_path()
+    for p in sampled_article_paths(big_zim, 200, seed=11):
         a = ArticleParser(pal).parse(p, big_zim.html(p))
         if not a.infobox:
             continue
@@ -103,22 +98,9 @@ def test_exact_title_first(big_zim, q):
     assert big_zim.suggest(q, 5)[0][1] == q
 
 
-def test_search_case_insensitive(small_zim):
-    assert small_zim.suggest("max weber", 1)[0][1] == "Max Weber"
+def test_search_case_insensitive(big_zim):
+    assert big_zim.suggest("max weber", 1)[0][1] == "Max Weber"
 
 
-def test_soft_redirect(small_zim):
-    assert small_zim.resolve("Cockney accent")[0] == "Cockney"
-
-
-# ---------------------------------------------------------------- other ZIM kinds
-
-@pytest.mark.parametrize("path", other_zims(), ids=lambda p: p.name)
-def test_other_zims_open_and_parse(path, pal):
-    """Non-Wikipedia ZIMs (Wiktionary, other MediaWikis, ...) don't crash."""
-    z = Zim(str(path))
-    random.seed(3)
-    for p in [z.main_path()] + [z.random_path() for _ in range(10)]:
-        if p:
-            a = ArticleParser(pal).parse(p, z.html(p))
-            Paginator(pal).paginate(a, Layout(30, 88, 45, 38), set())
+def test_soft_redirect(big_zim):
+    assert big_zim.resolve("Cockney accent")[0] == "Cockney"

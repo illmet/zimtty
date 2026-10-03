@@ -42,8 +42,8 @@ def test_compose_macro_parses_as_text():
 
 # ---------------------------------------------------------------- search
 
-async def test_search_text_visible_and_opens(small_zim):
-    app = ZimTTY(small_zim, None)
+async def test_search_text_visible_and_opens(big_zim):
+    app = ZimTTY(big_zim, None)
     async with app.run_test(size=(100, 30)) as pilot:
         await pilot.pause()
         inp = app.query_one("#search-input")
@@ -57,12 +57,12 @@ async def test_search_text_visible_and_opens(small_zim):
 
 
 @pytest.mark.parametrize("theme", ["catppuccin-latte", "nord", "flexoki-light"])
-async def test_search_visible_across_themes(small_zim, theme, monkeypatch):
+async def test_search_visible_across_themes(big_zim, theme, monkeypatch):
     colors = Path(f"/usr/share/omarchy/themes/{theme}/colors.toml")
     if not colors.exists():
         pytest.skip("omarchy theme not installed")
     monkeypatch.setattr(omatheme, "COLORS", colors)
-    app = ZimTTY(small_zim, None)
+    app = ZimTTY(big_zim, None)
     async with app.run_test(size=(100, 30)) as pilot:
         await pilot.press(*"weber")
         await pilot.pause(0.5)
@@ -95,8 +95,8 @@ async def test_typing_not_frozen_by_slow_query(big_zim):
 
 # ---------------------------------------------------------------- reading
 
-async def test_toc_jump_puts_heading_at_top_and_history(small_zim):
-    app = ZimTTY(small_zim, "Max Weber")
+async def test_toc_jump_puts_heading_at_top_and_history(big_zim):
+    app = ZimTTY(big_zim, "Max Weber")
     async with app.run_test(size=(150, 42)) as pilot:
         await pilot.pause()
         await pilot.press("j")
@@ -115,8 +115,8 @@ async def test_toc_jump_puts_heading_at_top_and_history(small_zim):
         assert app.article.title == "Max Weber" and app.page_i == page
 
 
-async def test_help_toggles_single_panel(small_zim):
-    app = ZimTTY(small_zim, "Max Weber")
+async def test_help_toggles_single_panel(big_zim):
+    app = ZimTTY(big_zim, "Max Weber")
     async with app.run_test(size=(150, 42)) as pilot:
         h = app.query_one(HelpPanel)
         await pilot.press("question_mark"); await pilot.pause()
@@ -127,8 +127,8 @@ async def test_help_toggles_single_panel(small_zim):
         assert not h.display and not app._notifications
 
 
-async def test_link_cursor_n_N_enter(small_zim):
-    app = ZimTTY(small_zim, "Max Weber")
+async def test_link_cursor_n_N_enter(big_zim):
+    app = ZimTTY(big_zim, "Max Weber")
     async with app.run_test(size=(150, 42)) as pilot:
         await pilot.pause()
         await pilot.press("n", "n", "n", "N"); await pilot.pause()
@@ -147,8 +147,8 @@ async def test_link_cursor_n_N_enter(small_zim):
         assert app.link_sel is None
 
 
-async def test_links_toggle(small_zim):
-    app = ZimTTY(small_zim, "Max Weber")
+async def test_links_toggle(big_zim):
+    app = ZimTTY(big_zim, "Max Weber")
     async with app.run_test(size=(150, 42)) as pilot:
         await pilot.pause()
         on, page = link_spans(app), app.page_i
@@ -162,8 +162,8 @@ async def test_links_toggle(small_zim):
         assert not app.plain_links
 
 
-async def test_notes_key(small_zim):
-    app = ZimTTY(small_zim, "Hunger in the United Kingdom")
+async def test_notes_key(big_zim):
+    app = ZimTTY(big_zim, "Hunger in the United Kingdom")
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.press("a"); await pilot.pause()
         assert app.pages[app.page_i].lines[0].plain.startswith("Additional notes")
