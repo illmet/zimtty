@@ -90,7 +90,7 @@ async def test_archive_search_and_notification_text_is_literal():
         await pilot.pause()
         assert name in drawn(app)
         await pilot.press(*"good")
-        await pilot.pause(0.1)
+        await pilot.pause(0.25)
         option = app.query_one("#search-results", OptionList).get_option_at_index(0)
         assert isinstance(option.prompt, Text)
         assert option.prompt.plain == title
@@ -135,7 +135,7 @@ async def test_metadata_and_search_controls_are_sanitized_without_changing_paths
     async with app.run_test(size=(140, 30)) as pilot:
         await pilot.pause()
         await pilot.press(*"good")
-        await pilot.pause(0.1)
+        await pilot.pause(0.25)
         option = app.query_one("#search-results", OptionList).get_option_at_index(0)
         assert option.id == path
         assert option.prompt.plain == "Result[31mTITLE_MARKER"

@@ -78,7 +78,7 @@ async def test_typing_not_frozen_by_slow_query(big_zim):
         pid = app._sugg_proc.pid
         inp = app.query_one("#search-input")
         await pilot.press("g")
-        await asyncio.sleep(0.15)
+        await wait_for(lambda: app._search_active is not None and app._search_active[1] == "g")
         t = time.perf_counter()
         await pilot.press("e")
         await wait_for(lambda: inp.value.endswith("e"))

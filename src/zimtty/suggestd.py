@@ -8,47 +8,29 @@ process has its own GIL.
 
 Protocol (JSON lines):  stdin  {"id": 3, "q": "mart"}
                         stdout {"id": 3, "q": "mart", "results": [[path, title], ...]}
-Only the newest pending query is answered; stale ones are skipped.
+The parent sends one active request and retains only its newest pending query.
+This helper executes each submitted request serially.
 """
 from __future__ import annotations
 
 import json
 import sys
-import threading
 
 
 def serve(zim_path: str) -> None:
     from .zimdoc import Zim
 
     zim = Zim(zim_path)
-    latest: dict | None = None
-    cond = threading.Condition()
-    eof = False
-
-    def reader():
-        nonlocal latest, eof
-        for line in sys.stdin:
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            with cond:
-                latest = msg  # overwrite: older unanswered queries are dropped
-                cond.notify()
-        with cond:
-            eof = True
-            cond.notify()
-
-    threading.Thread(target=reader, daemon=True).start()
     out = sys.stdout
     print(json.dumps({"ready": True}), file=out, flush=True)
-    while True:
-        with cond:
-            while latest is None and not eof:
-                cond.wait()
-            if latest is None and eof:
-                return
-            msg, latest = latest, None
+    for line in sys.stdin:
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if (not isinstance(msg, dict) or type(msg.get("id")) is not int
+                or not isinstance(msg.get("q"), str)):
+            continue
         response = {"id": msg.get("id"), "q": msg.get("q"), "results": []}
         try:
             res = zim.suggest(msg.get("q", ""), int(msg.get("n", 5)))

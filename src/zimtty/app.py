@@ -18,7 +18,7 @@ disable_framework_logging()
 
 from rich.style import Style
 from rich.text import Text
-from textual import on, work
+from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -209,6 +209,14 @@ class ZimTTY(App):
         self._search_timer = None
         self._results_for: str | None = None
         self._sugg_proc = None
+        self._sugg_ready = False
+        self._sugg_stopping = False
+        self._sugg_supervising = False
+        self._sugg_failed = False
+        self._sugg_failures = 0
+        self._search_pending: str | None = None
+        self._search_active: tuple[int, str, int] | None = None
+        self._search_epoch = 0
         self._query_id = 0
         self._open_on_results: str | None = None
         self.plain_links = False  # 'l': hide link styling and disable following
@@ -783,6 +791,7 @@ class ZimTTY(App):
     # -------------------------------------------------------------- search
 
     def action_search(self):
+        self._cancel_search_queue()
         bar = self.query_one(SearchBar)
         bar.display = True
         inp = self.query_one("#search-input", Input)
@@ -793,35 +802,82 @@ class ZimTTY(App):
         inp.focus()
 
     def _close_search(self):
+        self._cancel_search_queue()
         self.query_one(SearchBar).display = False
-        self._open_on_results = None
         self.set_focus(None)
+
+    def _cancel_search_queue(self):
+        if self._search_timer is not None:
+            self._search_timer.stop()
+            self._search_timer = None
+        self._search_pending = None
+        self._open_on_results = None
+        self._search_epoch += 1
+
+    def _current_search(self, q: str, epoch: int) -> bool:
+        return (not self._sugg_stopping and epoch == self._search_epoch
+                and self.query_one(SearchBar).display
+                and self.query_one("#search-input", Input).value == q)
 
     @on(Input.Changed, "#search-input")
     def _search_changed(self, ev: Input.Changed):
-        # debounce so a fast-typed word sends one query, not one per keystroke
+        # Invalidate queued text immediately, including during the debounce.
         if self._search_timer is not None:
             self._search_timer.stop()
+            self._search_timer = None
+        self._search_pending = None
+        self._open_on_results = None
+        self._results_for = None
+        self.query_one("#search-results", OptionList).clear_options()
         q = ev.value
-        self._search_timer = self.set_timer(0.08, lambda: self._send_query(q))
+        if q.strip() and self.query_one(SearchBar).display:
+            epoch = self._search_epoch
+
+            def submit():
+                if self._current_search(q, epoch):
+                    self._search_timer = None
+                    self._send_query(q)
+
+            self._search_timer = self.set_timer(0.2, submit)
 
     # Queries run in a separate process (suggestd.py): libzim holds the GIL, so a
     # thread would freeze the UI for 1-2 s on short queries against the full ZIM.
     async def _start_suggestd(self):
-        try:
-            self._sugg_proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "zimtty.suggestd", self.zim.path,
-                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL, limit=1 << 20,
-            )
-        except OSError as error:
-            self.diagnostics.record(Event.SEARCH_START_FAILED, error)
-            self._sugg_proc = None
+        if self._sugg_supervising or self._sugg_stopping or self._sugg_failed:
             return
-        self.run_worker(self._read_suggestd(), exclusive=False, group="suggestd")
+        self._sugg_supervising = True
+        try:
+            while not self._sugg_stopping:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        sys.executable, "-m", "zimtty.suggestd", self.zim.path,
+                        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL, limit=1 << 20,
+                    )
+                except OSError as error:
+                    self.diagnostics.record(Event.SEARCH_START_FAILED, error)
+                else:
+                    if self._sugg_stopping:
+                        await self._reap_suggestd(proc)
+                        return
+                    self._sugg_proc = proc
+                    self._sugg_ready = False
+                    await self._read_suggestd(proc)
+                if self._sugg_stopping:
+                    return
+                self._sugg_failures += 1
+                if self._sugg_failures >= 3:
+                    self._sugg_failed = True
+                    self._search_pending = None
+                    self._open_on_results = None
+                    self.notify("Title search is unavailable; restart the reader to retry.", timeout=4)
+                    return
+                await asyncio.sleep((0.2, 0.5)[self._sugg_failures - 1])
+        finally:
+            self._sugg_supervising = False
 
-    async def _read_suggestd(self):
-        proc = self._sugg_proc
+    async def _read_suggestd(self, proc=None):
+        proc = self._sugg_proc if proc is None else proc
         if proc is None:
             return
         try:
@@ -843,58 +899,91 @@ class ZimTTY(App):
                 if not isinstance(msg, dict):
                     self.diagnostics.record(Event.SEARCH_PIPE_FAILED)
                     continue
-                if msg.get("error") == "search_failed":
-                    self.diagnostics.record(Event.SEARCH_QUERY_FAILED)
+                if self._sugg_proc is not proc:
+                    break
+                if msg.get("ready") is True:
+                    self._sugg_ready = True
+                    self._dispatch_query()
+                    continue
                 if "results" in msg:
                     results = msg["results"]
-                    if (not isinstance(msg.get("q"), str) or not isinstance(results, list)
+                    if (type(msg.get("id")) is not int or not isinstance(msg.get("q"), str)
+                            or not isinstance(results, list)
                             or not all(isinstance(r, list) and len(r) == 2
                                        and all(isinstance(s, str) for s in r) for r in results)):
                         self.diagnostics.record(Event.SEARCH_PIPE_FAILED)
                         continue
-                    self._show_results(msg["q"], [tuple(r) for r in results])
+                    active = self._search_active
+                    if active is None or (msg["id"], msg["q"]) != active[:2]:
+                        continue
+                    self._search_active = None
+                    self._sugg_failures = 0
+                    if msg.get("error") == "search_failed":
+                        self.diagnostics.record(Event.SEARCH_QUERY_FAILED)
+                    if self._current_search(active[1], active[2]):
+                        self._show_results(msg["q"], [tuple(r) for r in results])
+                    self._dispatch_query()
         finally:
             if self._sugg_proc is proc:
-                self._sugg_proc = None  # next query falls back to in-process search
-            if proc.returncode is None:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass  # exited between the returncode check and kill
-            await proc.wait()
+                self._sugg_proc = None
+                self._sugg_ready = False
+                active, self._search_active = self._search_active, None
+                if (active is not None and self._search_pending is None and self._search_timer is None
+                        and self._current_search(active[1], active[2])):
+                    self._search_pending = active[1]
+            await self._reap_suggestd(proc)
 
     def _send_query(self, q: str):
+        if not q.strip() or not self._current_search(q, self._search_epoch):
+            return
+        if self._sugg_failed:
+            self.notify("Title search is unavailable; restart the reader to retry.", timeout=4)
+            return
+        active = self._search_active
+        if active is not None and active[1:] == (q, self._search_epoch):
+            self._search_pending = None
+            return
+        self._search_pending = q
+        self._dispatch_query()
+
+    def _dispatch_query(self):
         proc = self._sugg_proc
-        if proc is None or proc.stdin is None or proc.returncode is not None:
-            self._suggest_inprocess(q)
+        q = self._search_pending
+        if (q is None or self._search_active is not None or not self._sugg_ready
+                or proc is None or proc.stdin is None or proc.returncode is not None):
+            return
+        self._search_pending = None
+        if not self._current_search(q, self._search_epoch):
             return
         self._query_id += 1
+        self._search_active = (self._query_id, q, self._search_epoch)
         try:
             proc.stdin.write((json.dumps({"id": self._query_id, "q": q}) + "\n").encode())
-        except (BrokenPipeError, ConnectionResetError, RuntimeError) as error:
+        except (OSError, RuntimeError) as error:
             self.diagnostics.record(Event.SEARCH_PIPE_FAILED, error)
-            self._sugg_proc = None
-            self._suggest_inprocess(q)
+            self._sugg_ready = False
+            try:
+                proc.kill()  # the reader reaps it and the supervisor retries
+            except ProcessLookupError:
+                pass
 
-    @work(thread=True, exclusive=True)
-    def _suggest_inprocess(self, q: str):
-        try:
-            res = self.zim.suggest(q, 5)
-        except (OSError, RuntimeError, ValueError, KeyError) as error:
-            self.diagnostics.record(Event.SEARCH_QUERY_FAILED, error)
-            res = []
-        self.call_from_thread(self._show_results, q, res)
+    @staticmethod
+    async def _reap_suggestd(proc):
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        await proc.wait()
 
     async def on_unmount(self) -> None:
-        proc = getattr(self, "_sugg_proc", None)
+        self._sugg_stopping = True
+        self._cancel_search_queue()
+        proc, self._sugg_proc = self._sugg_proc, None
+        self._sugg_ready = False
+        self._search_active = None
         if proc is not None:
-            self._sugg_proc = None
-            if proc.returncode is None:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-            await proc.wait()
+            await self._reap_suggestd(proc)
 
     def _show_results(self, q: str, res: list[tuple[str, str]]):
         if self.query_one("#search-input", Input).value != q:
@@ -930,6 +1019,7 @@ class ZimTTY(App):
         self._open_on_results = ev.value
         if self._search_timer is not None:
             self._search_timer.stop()
+            self._search_timer = None
         self._send_query(ev.value)
 
     @on(OptionList.OptionSelected, "#search-results")

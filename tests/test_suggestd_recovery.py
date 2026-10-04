@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from zimtty.app import ZimTTY
-from zimtty.diagnostics import DiagnosticTrace
+from tests.test_security_ui import MemoryZim
 
 
 def process(reader, returncode=None):
@@ -18,10 +18,14 @@ def process(reader, returncode=None):
 
 
 def app_for(proc):
-    return SimpleNamespace(
-        _sugg_proc=proc, _show_results=Mock(), _suggest_inprocess=Mock(),
-        diagnostics=DiagnosticTrace(),
-    )
+    app = ZimTTY(MemoryZim(), None)
+    app._sugg_proc = proc
+    app._sugg_ready = True
+    app._search_active = (7, "query", app._search_epoch)
+    app._current_search = Mock(return_value=True)
+    app._show_results = Mock()
+    app._dispatch_query = Mock()
+    return app
 
 
 @pytest.mark.parametrize("failure", ["oversized", "io"])
@@ -42,12 +46,13 @@ async def test_failed_suggestion_read_cleans_up_and_allows_next_query(failure):
     proc.wait.assert_awaited_once_with()
     app._show_results.assert_not_called()
     ZimTTY._send_query(app, "next query")
-    app._suggest_inprocess.assert_called_once_with("next query")
+    assert app._search_pending == "next query"
+    assert not hasattr(app, "_suggest_inprocess")
 
 
 async def test_valid_results_are_delivered_and_exited_process_is_reaped():
     reader = asyncio.StreamReader()
-    reader.feed_data(b'bad json\n{"q":"query","results":[["path","title"]]}\n')
+    reader.feed_data(b'bad json\n{"id":7,"q":"query","results":[["path","title"]]}\n')
     reader.feed_eof()
     proc = process(reader, returncode=0)
     app = app_for(proc)
@@ -62,9 +67,10 @@ async def test_valid_results_are_delivered_and_exited_process_is_reaped():
 
 async def test_malformed_result_shapes_are_skipped_without_losing_valid_results():
     reader = asyncio.StreamReader()
-    messages = [None, 1, [], {"results": []}, {"q": "private", "results": [[1, 2]]},
-                {"q": "private", "results": ["bad"]},
-                {"q": "query", "results": [["path", "title"]]}]
+    messages = [None, 1, [], {"results": []},
+                {"id": 7, "q": "query", "results": [[1, 2]]},
+                {"id": 7, "q": "query", "results": ["private"]},
+                {"id": 7, "q": "query", "results": [["path", "title"]]}]
     for message in messages:
         reader.feed_data(json.dumps(message).encode() + b"\n")
     reader.feed_eof()
@@ -93,7 +99,7 @@ async def test_cancelling_reader_still_cleans_up_its_process():
 
 async def test_old_reader_does_not_clear_replacement_process():
     reader = asyncio.StreamReader()
-    reader.feed_data(b'{"q":"query","results":[]}\n')
+    reader.feed_data(b'{"id":7,"q":"query","results":[]}\n')
     reader.feed_eof()
     old = process(reader)
     new = process(asyncio.StreamReader())
