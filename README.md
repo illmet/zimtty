@@ -27,6 +27,7 @@ terminal recording can still leave a record outside the app.
     uv run zimtty path/to/file.zim      # choose an archive, or set ZIMTTY_ZIM
     uv run zimtty --diagnostics         # print the short trace after exiting
 
+    # optional alias to quickly jump to the application
     alias wiki='uv run --offline --no-sync --project /path-to/zimtty zimtty'
 
 ## Keys
@@ -44,6 +45,8 @@ terminal recording can still leave a record outside the app.
     R                            random article
     ?                            key help (press ? again or esc to close)
     q / esc                      quit / close panel
+
+When searching, title suggestions update after a 200 ms pause in typing. Enter submits immediately.
 
 ## Code
 
@@ -74,8 +77,11 @@ section-based HTML, code, tables, links, and malformed input without downloads.
 
 ## Theme sync
 
-On Omarchy, colours follow the active theme through
-`~/.local/state/omarchy/current/theme/colors.toml` and update while the reader is
-running. Outside Omarchy, or when that file is missing, a built-in palette is used.
-An invalid theme at startup also uses the default palette; an invalid live edit
-keeps the last working theme until a valid update is available.
+By default, zimtty uses a built-in dark palette inspired by Tokyo Night, with
+a dark background, pale text, and blue accents.
+
+When a compatible theme file is available, the reader follows its colours and
+picks up changes every two seconds. For example, Omarchy supplies this file at
+`~/.local/state/omarchy/current/theme/colors.toml` (under `$XDG_STATE_HOME` when
+set). Other theme tools can sync colours by maintaining a compatible file at
+the same location.
