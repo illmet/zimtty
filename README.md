@@ -8,10 +8,12 @@ with headings kept beside their text and infoboxes shown alongside the article
 or inline on narrower screens. 
 
 The reader preserves code indentation, lists, captions, and technical warnings.
-Simple tables use aligned columns with repeating headers and full-width titles
-or notes; cramped, irregular, and complex merged tables fall back to readable
-rows of text. Long code lines fold to fit, and article text and tables use up to
-88 columns. Wikipedia `nopic` and English ArchWiki archives have integration
+Tables keep their columns, including merged cells and multi-row headers, with
+headers repeated on each page and full-width titles or notes. Columns left
+empty by the missing images (portraits, party colours) are dropped. Tables too
+wide for the screen, or whose sentences would be squeezed into narrow columns,
+become records labelled by their headers. Long code lines fold to fit, and
+article text and tables use up to 88 columns. Wikipedia `nopic` and English ArchWiki archives have integration
 coverage; other text-based wikis may need adjustments for their particular HTML.
 The minimum supported terminal size is 24 columns by 8 rows.
 

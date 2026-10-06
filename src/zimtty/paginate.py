@@ -9,6 +9,10 @@ Rules (agreed design):
   * every h2 (and any heading the user jumped to via the TOC) starts a page
   * the infobox sits in its own box on the right; if it is taller than a
     page it continues on the next page; once it runs out the text goes full width
+  * table rows stay whole unless taller than a page; header rows repeat on
+    each page of a grid, and a merged cell continuing onto a new page is
+    repeated (muted) on its first row
+  * tables too wide for their columns become records labelled by the headers
 """
 from __future__ import annotations
 
@@ -21,7 +25,8 @@ from rich.console import Console
 from rich.style import Style
 from rich.text import Text
 
-from .zimdoc import Article, Block, InfoRow, Palette, TableData
+from .zimdoc import (Article, Block, InfoRow, Palette, TableCell, TableData, header_rows,
+                     place_cells, rule_breaks)
 
 _console = Console(width=400, color_system=None, legacy_windows=False, emoji=False)
 
@@ -29,6 +34,9 @@ SENTENCE_END = re.compile(r"(?<=[.!?])[\"'”’)\]]*\s+(?=[\"“(\[]?[A-Z0-9])"
 TIGHT = {"item", "ref"}  # consecutive list items get no blank line between them
 HEADINGS = {"title", "h2", "h3", "h4"}
 NUMBER_TOKEN = re.compile(r"(?<![\w.])[+−-]?\d+(?:[,.]\d+)*(?:[%‰])?(?![\w.])")
+LIST_ITEM = re.compile(r"[•◦]|\d+\. ")  # list markers added by the parser
+RUNNING_TEXT = 40  # average longest line of the values in a column of sentences
+TEXT_COLUMN = 14  # narrowest grid column for running text
 
 
 def wrap(text: Text, width: int) -> list[Text]:
@@ -42,6 +50,17 @@ def wrap(text: Text, width: int) -> list[Text]:
         if ln.cell_len > width:
             ln.truncate(width)
         out.append(ln)
+    return out
+
+
+def joined(separator: Text, parts: list[Text]) -> Text:
+    """Text.join, except the separator's style stays on the separators
+    instead of becoming the base style of every part."""
+    out = Text()
+    for k, part in enumerate(parts):
+        if k:
+            out.append_text(separator)
+        out.append_text(part)
     return out
 
 
@@ -89,15 +108,97 @@ class _PreFlow:
         return out
 
 
+class _Grid:
+    """Cell positions of a table that follows the HTML table model.
+
+    Every slot of a non-band row refers to the cell covering it, so a merged
+    cell appears once per covered slot and starts in exactly one row.
+    """
+
+    def __init__(self, table: TableData, starts: list[list[int]], width: int):
+        bands = table.full_width_rows
+        self.width = width
+        self.header = header_rows(table.rows, bands)
+        self.slots: list[list[TableCell | None]] = [
+            [] if r in bands else [None] * width for r in range(len(table.rows))]
+        self.origin: dict[int, int] = {}  # id(cell) -> the row it starts in
+        self.cells: list[tuple[int, TableCell, int, int]] = []  # (row, cell, start, end)
+        self.carried: set[int] = set()  # rows covered by a cell from an earlier row
+        self._labels: dict[tuple[int, int], Text | None] = {}
+        for r, (row, row_starts) in enumerate(zip(table.rows, starts)):
+            if r in bands:
+                continue
+            for cell, start in zip(row, row_starts):
+                self.origin[id(cell)] = r
+                self.cells.append((r, cell, start, start + cell.colspan))
+                for covered in range(r, min(r + cell.rowspan, len(table.rows))):
+                    if covered not in bands:
+                        self.slots[covered][start:start + cell.colspan] = [cell] * cell.colspan
+                        if covered != r:
+                            self.carried.add(covered)
+
+    def segments(self, r: int) -> list[tuple[TableCell | None, int, int, bool]]:
+        """(cell, start, end, starts_here) for each run of slots sharing a cell."""
+        row = self.slots[r]
+        out = []
+        start = 0
+        while start < self.width:
+            cell = row[start]
+            end = start + 1
+            while cell is not None and end < self.width and row[end] is cell:
+                end += 1
+            out.append((cell, start, end, cell is not None and self.origin[id(cell)] == r))
+            start = end
+        return out
+
+    def continued(self, r: int) -> bool:
+        """The first column continues a data cell from an earlier row (a sub-row)."""
+        row = self.slots[r]
+        if not row or row[0] is None:
+            return False
+        origin = self.origin[id(row[0])]
+        return origin != r and origin not in self.header
+
+    def title(self, cell: TableCell) -> bool:
+        """A header cell spanning the whole table names no particular column."""
+        return self.width > 1 and cell.colspan == self.width
+
+    def label(self, start: int, end: int) -> Text | None:
+        """Header text covering these columns, outermost first. Without a
+        header over the whole span, each column's own label is listed."""
+        key = (start, end)
+        if key not in self._labels:
+            found: list[TableCell] = []
+            for r in self.header:
+                row = self.slots[r]
+                cell = row[start]
+                if (cell is None or self.title(cell) or any(cell is seen for seen in found)
+                        or any(row[c] is not cell for c in range(start, end))):
+                    continue
+                found.append(cell)
+            parts = [line for cell in found for line in cell.text.split("\n") if line.plain.strip()]
+            if parts:
+                self._labels[key] = Text(" ").join(parts)
+            elif end - start > 1:
+                own = {label.plain: label for c in range(start, end)
+                       if (label := self.label(c, c + 1)) is not None}
+                self._labels[key] = Text(" / ").join(own.values()) if own else None
+            else:
+                self._labels[key] = None
+        return self._labels[key]
+
+
 class _TableMeasure:
     """Bounded layout comparisons used only when changing column allocation."""
 
-    def __init__(self, table: TableData, width: int):
-        self.rows = [row for i, row in enumerate(table.rows) if i not in table.full_width_rows]
+    def __init__(self, paginator: Paginator, table: TableData, grid: _Grid, width: int):
+        self.paginator = paginator
+        self.table = table
+        self.model = grid
+        self.rows = [r for r in range(len(table.rows)) if r not in table.full_width_rows]
         self.width = width
-        self.header = self.rows[0] if self.rows and all(c.header for c in self.rows[0]) else []
-        self.available = (len(self.rows) <= 128 and sum(map(len, self.rows)) <= 512
-                          and sum(len(c.text.plain) for row in self.rows for c in row) <= 40_000)
+        self.available = (len(self.rows) <= 128 and len(grid.cells) <= 512
+                          and sum(len(cell.text.plain) for _, cell, _, _ in grid.cells) <= 40_000)
         self.calls = 2048
         self.characters = 250_000
         self.cache: dict[tuple[int, int, bool], int] = {}
@@ -119,31 +220,36 @@ class _TableMeasure:
         return height
 
     def grid(self, columns: list[int]) -> int | None:
-        height = int(bool(self.header))  # header rule
-        for row in self.rows:
-            heights = [self._height(cell.text, width, cell.preformatted)
-                       for cell, width in zip(row, columns)]
-            if any(value is None for value in heights):
-                return None
-            height += max(heights, default=1)
+        height = int(bool(self.model.header))  # header rule
+        for r in self.rows:
+            tallest = 0
+            for cell, start, end, starts_here in self.model.segments(r):
+                if cell is None or not starts_here:
+                    continue  # a continued cell is shown only where it starts
+                value = self._height(cell.text, sum(columns[start:end]) + 3 * (end - start - 1),
+                                     cell.preformatted)
+                if value is None:
+                    return None
+                tallest = max(tallest, value)
+            height += tallest
         return height
 
-    def records(self) -> int | None:
-        height = max(0, 2 * len(self.rows) - 1)  # Row labels and inter-row gaps
-        for ri, row in enumerate(self.rows):
-            for ci, cell in enumerate(row):
-                label = self.header[ci].text if self.header and ri else Text(f"Cell {ci + 1}")
-                if cell.preformatted:
-                    label_height = self._height(label + Text(":"), self.width, cache=False)
-                    value_height = self._height(cell.text, self.width, True)
-                    if label_height is None or value_height is None:
-                        return None
-                    height += label_height + value_height
-                else:
-                    value_height = self._height(label + Text(": ") + cell.text, self.width, cache=False)
-                    if value_height is None:
-                        return None
-                    height += value_height
+    def records(self, limit: int | None = None) -> int | None:
+        """Height of the record layout, plus one line per record: columns that
+        line up across rows are worth that much when choosing a layout.
+        Measuring stops once the height reaches limit."""
+        if not self.available:
+            return None
+        height = 0
+        for r in self.rows:
+            lines = self.paginator._record(self.table, self.model, r, self.width)
+            if not lines:
+                continue
+            if not self.paginator._attached(self.table, self.model, r):
+                height += 1 + int(height > 0)  # a blank line between records
+            height += len(lines)  # sub-rows attach to their record
+            if limit is not None and height >= limit:
+                break
         return height
 
 
@@ -170,7 +276,8 @@ class Paginator:
         self.pal = pal
         self._cache: dict[tuple[int, int], list[Text]] = {}
         self._table_widths: dict[tuple[int, int], list[int] | None] = {}
-        self._table_headers: dict[int, int | None] = {}
+        self._grids: dict[int, _Grid | None] = {}
+        self._rows: dict[tuple[int, int, int, bool], list[Text]] = {}
 
     # ---------------------------------------------------------- rendering
 
@@ -240,7 +347,10 @@ class Paginator:
         if b.kind == "table" and b.table is not None:
             height = len(wrap(b.table.caption, width)) + 1 if b.table.caption.plain else 0
             for row in range(len(b.table.rows)):
-                height += len(self._table_row(b.table, row, width))
+                lines = self._table_row(b.table, row, width)
+                if not lines:
+                    continue  # header text shown as record labels
+                height += len(lines)
                 if height >= limit:
                     return limit
                 if self._columns(b.table, width) is None:
@@ -253,24 +363,36 @@ class Paginator:
         key = (id(table), width)
         if key in self._table_widths:
             return self._table_widths[key]
-        rows = [row for index, row in enumerate(table.rows) if index not in table.full_width_rows]
-        count = len(rows[0]) if rows else 0
+        grid = self._grid(table)
+        count = grid.width if grid is not None else 0
         result = None
-        if (table.simple and width >= 32 and 0 < count <= 16
-                and all(len(row) == count for row in rows)
+        if (table.simple and grid is not None and width >= 32 and 0 < count <= 16
                 and count * 4 + (count - 1) * 3 <= width):
             preferred = [4] * count
             minimum = [4] * count
-            for row in rows:
-                for i, cell in enumerate(row):
-                    preferred[i] = max(preferred[i], min(width, max(
-                        (line.cell_len for line in cell.text.split("\n")), default=0
-                    )))
-                    if not cell.preformatted:
-                        minimum[i] = max(minimum[i], max(
-                            (min(width, cell_len(match.group())) for match in NUMBER_TOKEN.finditer(cell.text.plain)),
-                            default=4,
-                        ))
+            line_lengths = [0] * count  # each value's longest line, summed per column
+            values = [0] * count
+            merged = []
+            for row, cell, i, end in grid.cells:
+                longest = max((line.cell_len for line in cell.text.split("\n")), default=0)
+                if end - i != 1:
+                    merged.append((i, end, min(width, longest)))
+                    continue
+                preferred[i] = max(preferred[i], min(width, longest))
+                if not cell.preformatted:
+                    minimum[i] = max(minimum[i], max(
+                        (min(width, cell_len(match.group())) for match in NUMBER_TOKEN.finditer(cell.text.plain)),
+                        default=4,
+                    ))
+                if row not in grid.header and cell.text.plain.strip():
+                    line_lengths[i] += longest
+                    values[i] += 1
+            # A merged cell wraps across the columns it spans; ask them for
+            # enough room between them to fit its longest line.
+            for start, end, longest in merged:
+                short = longest - sum(preferred[start:end]) - 3 * (end - start - 1)
+                for k in range(max(short, 0)):
+                    preferred[start + k % (end - start)] += 1
             result = [min(8, size) for size in preferred]
             budget = width - (count - 1) * 3
             recovering = sum(result) > budget
@@ -294,7 +416,7 @@ class Paginator:
                 for i in range(count):
                     while result[i] < minimum[i]:
                         if measure is None:
-                            measure = _TableMeasure(table, width)
+                            measure = _TableMeasure(self, table, grid, width)
                         donors = [j for j in range(count) if result[j] > minimum[j]]
                         donor = max(donors, key=lambda j: result[j] - minimum[j])
                         measured = []
@@ -313,73 +435,189 @@ class Paginator:
                             break  # minima fit the budget; defensive for malformed models
                         result[donor] -= take
                         result[i] += take
-                if recovering:
+                # Sentences squeezed into a narrow column break words and wrap
+                # every word or two; records give running text the full width.
+                if any(values[i] and line_lengths[i] >= RUNNING_TEXT * values[i]
+                       and result[i] < TEXT_COLUMN for i in range(count)):
+                    result = None
+                elif recovering:
                     if measure is None:
-                        measure = _TableMeasure(table, width)
-                    grid_height, record_height = measure.grid(result), measure.records()
+                        measure = _TableMeasure(self, table, grid, width)
+                    grid_height = measure.grid(result)
+                    record_height = (measure.records(limit=grid_height)
+                                     if grid_height is not None else None)
                     if grid_height is None or record_height is None or grid_height > record_height:
                         result = None
         self._table_widths[key] = result
         return result
 
-    def _table_header_index(self, table: TableData) -> int | None:
+    def _grid(self, table: TableData) -> _Grid | None:
+        """Cell positions, or None for spans kept in source order."""
         key = id(table)
-        if key not in self._table_headers:
-            index = next((i for i, row in enumerate(table.rows)
-                          if i not in table.full_width_rows), None) if table.simple else None
-            self._table_headers[key] = (index if index is not None and table.rows[index]
-                                       and all(cell.header for cell in table.rows[index]) else None)
-        return self._table_headers[key]
+        if key not in self._grids:
+            placed = (place_cells(table.rows, table.full_width_rows)
+                      if table.simple or table.aligned else None)
+            self._grids[key] = _Grid(table, *placed) if placed is not None else None
+        return self._grids[key]
 
-    def _table_row(self, table: TableData, index: int, width: int) -> list[Text]:
+    def _header(self, table: TableData) -> range:
+        grid = self._grid(table)
+        return grid.header if grid is not None else range(0)
+
+    def _header_lines(self, table: TableData, width: int) -> list[Text]:
+        """Every header row, ending with its rule; empty for records."""
+        return [line for row in self._header(table) for line in self._table_row(table, row, width)]
+
+    @staticmethod
+    def _attached(table: TableData, grid: _Grid, index: int) -> bool:
+        """A record sub-row, listed under the row whose first cell it continues."""
+        return grid.continued(index) and not any(cell.preformatted for cell in table.rows[index])
+
+    def _cell_text(self, cell: TableCell) -> Text:
+        text = cell.text.copy()
+        text.expand_tabs(8)
+        if cell.header:
+            text.stylize(Style(bold=True, color=self.pal.heading))
+        return text
+
+    @staticmethod
+    def _cell_lines(text: Text, width: int, preformatted: bool) -> list[Text]:
+        if preformatted:
+            return [part for line in text.split("\n", allow_blank=True)
+                    for part in fold_preserving(line, width)]
+        return wrap(text, width)
+
+    def _join_lines(self, text: Text, lists: bool = True) -> Text:
+        """A cell value flowed as running text for records.
+
+        Line breaks inside a value (a date, a name and its lifespan) become
+        spaces and rejoin hyphenated words; values stacked with <hr> are
+        separated by ' · '. List items keep their own lines unless lists=False.
+        """
+        plain = text.plain
+        if "\n" not in plain:
+            return text
+        rules = rule_breaks(text)
+        out = Text()
+        start = 0
+        for k, character in enumerate(plain):
+            if character != "\n":
+                continue
+            out.append_text(text[start:k])
+            following = plain[k + 1:]
+            if lists and LIST_ITEM.match(following):
+                out.append("\n")
+            elif k in rules:
+                out.append(" · ", Style(color=self.pal.muted))
+            elif not (plain[k - 1:k] == "-" and following[:1].isalpha()):
+                out.append(" ")
+            start = k + 1
+        out.append_text(text[start:])
+        return out
+
+    def _field(self, label: Text, cell: TableCell, text: Text, width: int, hang: int = 0) -> list[Text]:
+        """'Label: value', with wrapped lines indented by hang."""
+        label = label.copy()
+        label.stylize(Style(bold=True, color=self.pal.muted))
+        if cell.preformatted:
+            return wrap(label + Text(":"), width) + self._cell_lines(text, width, True)
+        lines = wrap(label + Text(": ") + text, width - hang)
+        return lines[:1] + [Text(" " * hang) + line for line in lines[1:]]
+
+    def _table_row(self, table: TableData, index: int, width: int, top: bool = False) -> list[Text]:
+        """Screen lines for one table row. top=True places it first on a page,
+        where values continued from rows above are repeated for context."""
+        grid = self._grid(table)
+        top = top and grid is not None and index in grid.carried
+        key = (id(table), index, width, top)
+        if key not in self._rows:
+            self._rows[key] = self._render_row(table, index, width, top)
+        return self._rows[key]
+
+    def _render_row(self, table: TableData, index: int, width: int, top: bool) -> list[Text]:
         row = table.rows[index]
-        columns = self._columns(table, width)
-        cells = []
-        for cell in row:
-            text = cell.text.copy()
-            text.expand_tabs(8)
-            if cell.header:
-                text.stylize(Style(bold=True, color=self.pal.heading))
-            cells.append(text)
-        def cell_lines(text: Text, column_width: int, preformatted: bool) -> list[Text]:
-            if preformatted:
-                return [part for line in text.split("\n", allow_blank=True)
-                        for part in fold_preserving(line, column_width)]
-            return wrap(text, column_width)
-
         if index in table.full_width_rows:
-            return [line for cell, text in zip(row, cells)
-                    for line in cell_lines(text, width, cell.preformatted)]
-
-        header_index = self._table_header_index(table)
+            return [line for cell in row
+                    for line in self._cell_lines(self._cell_text(cell), width, cell.preformatted)]
+        columns = self._columns(table, width)
+        grid = self._grid(table)
         if columns is not None:
-            wrapped = [cell_lines(text, col, cell.preformatted)
-                       for cell, text, col in zip(row, cells, columns)]
-            out = []
-            separator = Text(" │ ", Style(color=self.pal.muted))
-            for line in range(max((len(parts) for parts in wrapped), default=1)):
-                pieces = []
-                for parts, col in zip(wrapped, columns):
-                    part = parts[line].copy() if line < len(parts) else Text("")
-                    part.pad_right(max(0, col - part.cell_len))
-                    pieces.append(part)
-                out.append(separator.join(pieces))
-            if index == header_index:
-                out.append(Text("─" * (sum(columns) + 3 * (len(columns) - 1)),
-                                Style(color=self.pal.muted)))
-            return out
-        # Complex spans have no inferred column labels: preserve source order.
+            return self._grid_row(grid, index, columns, top)
+        if grid is not None:
+            return self._record(table, grid, index, width, top)
+        # Unvalidated spans have no column positions: preserve source order.
         out = [Text(f"Row {index + 1}", Style(color=self.pal.muted))]
-        headers = table.rows[header_index] if header_index is not None and index > header_index else []
-        for i, text in enumerate(cells):
-            label = (headers[i].text.copy() if i < len(headers)
-                     else Text(f"Cell {i + 1}"))
-            label.stylize(Style(bold=True, color=self.pal.muted))
-            if row[i].preformatted:
-                out.extend(wrap(label + Text(":"), width))
-                out.extend(cell_lines(text, width, True))
-            else:
-                out.extend(wrap(label + Text(": ") + text, width))
+        for i, cell in enumerate(row):
+            out.extend(self._field(Text(f"Cell {i + 1}"), cell, self._cell_text(cell), width))
+        return out
+
+    def _grid_row(self, grid: _Grid, index: int, columns: list[int], top: bool = False) -> list[Text]:
+        wrapped: list[list[Text]] = []
+        widths: list[int] = []
+        for cell, start, end, starts_here in grid.segments(index):
+            width = sum(columns[start:end]) + 3 * (end - start - 1)
+            widths.append(width)
+            if cell is None or not (starts_here or top):
+                wrapped.append([])  # a merged cell shows once, where it starts
+                continue
+            text = self._cell_text(cell)
+            if not starts_here:
+                text.stylize(Style(color=self.pal.muted))
+            wrapped.append(self._cell_lines(text, width, cell.preformatted))
+        out = []
+        separator = Text(" │ ", Style(color=self.pal.muted))
+        for line in range(max((len(parts) for parts in wrapped), default=1)):
+            pieces = []
+            for parts, width in zip(wrapped, widths):
+                part = parts[line].copy() if line < len(parts) else Text("")
+                part.pad_right(max(0, width - part.cell_len))
+                pieces.append(part)
+            out.append(joined(separator, pieces))
+        if grid.header and index == grid.header.stop - 1:
+            out.append(Text("─" * (sum(columns) + 3 * (len(columns) - 1)),
+                            Style(color=self.pal.muted)))
+        return out
+
+    def _record(self, table: TableData, grid: _Grid, index: int, width: int,
+                top: bool = False) -> list[Text]:
+        """A row as 'Label: value' lines named by the header rows above it.
+
+        Values merged down from earlier rows repeat in each record they cover.
+        A row continuing the first cell of the one above is a sub-row: its own
+        values share one indented line beneath that record, unless it starts a
+        page, where it shows the continued values too (muted) for context.
+        """
+        if index in grid.header:
+            # Header text labels every record; only a title has lines of its own.
+            return [line for cell, _, _, starts_here in grid.segments(index)
+                    if cell is not None and starts_here and grid.title(cell)
+                    for line in wrap(self._cell_text(cell), width)]
+        labelled = bool(grid.header)
+        attached = self._attached(table, grid, index) and not top
+        fields = []
+        for cell, start, end, starts_here in grid.segments(index):
+            if cell is None or (attached and not starts_here) or not cell.text.plain.strip():
+                continue
+            text = self._cell_text(cell)
+            if not cell.preformatted:
+                text = self._join_lines(text, lists=not attached)
+            if not starts_here and grid.continued(index):
+                text.stylize(Style(color=self.pal.muted))
+            label = (grid.label(start, end) if labelled else None) or Text(f"Cell {start + 1}")
+            fields.append((label, cell, text))
+        if attached:
+            pieces = []
+            for label, _, text in fields:
+                label = label.copy()
+                label.stylize(Style(bold=True, color=self.pal.muted))
+                pieces.append(label + Text(": ") + text)
+            if not pieces:
+                return []
+            lines = wrap(joined(Text(" · ", Style(color=self.pal.muted)), pieces), width - 4)
+            return [Text("  ") + lines[0]] + [Text("    ") + line for line in lines[1:]]
+        out = [] if labelled else [Text(f"Row {index + 1}", Style(color=self.pal.muted))]
+        for label, cell, text in fields:
+            out.extend(self._field(label, cell, text, width, hang=2 if labelled else 0))
         return out
 
     def render_info(self, rows: list[InfoRow], width: int) -> list[Text]:
@@ -482,7 +720,8 @@ class Paginator:
     def paginate(self, art: Article, lay: Layout, breaks: set[int]) -> list[Page]:
         self._cache = {}
         self._table_widths = {}
-        self._table_headers = {}
+        self._grids = {}
+        self._rows = {}
         H = max(lay.height, 4)
         info_lines = self.render_info(art.infobox, lay.info_width) if (art.infobox and lay.info_width) else []
         info_per_page = max(H - 2, 1)  # box border takes 2 rows
@@ -558,18 +797,25 @@ class Paginator:
 
             if b.kind == "table" and b.table is not None:
                 table = b.table
-                header_index = self._table_header_index(table)
-                first_data_index = next((row for row in range((header_index or 0) + 1, len(table.rows))
+                grid = self._grid(table)
+                header = self._header(table)
+                header_index = header.start if header else None
+                first_data_index = next((row for row in range(header.stop if header else 1, len(table.rows))
                                          if row not in table.full_width_rows), None)
                 header_cache: dict[int, list[Text]] = {}
 
                 def header_for(width: int) -> list[Text]:
                     if width not in header_cache:
-                        header = (self._table_row(table, header_index, width)
-                                  if header_index is not None
-                                  and self._columns(table, width) is not None else [])
-                        header_cache[width] = header if len(header) <= H // 3 else []
+                        lines = (self._header_lines(table, width)
+                                 if self._columns(table, width) is not None else [])
+                        header_cache[width] = lines if len(lines) <= H // 3 else []
                     return header_cache[width]
+
+                def render(row: int, width: int, top: bool = False) -> list[Text]:
+                    """A grid places its header rows together, as one row."""
+                    if row == header_index and self._columns(table, width) is not None:
+                        return self._header_lines(table, width)
+                    return self._table_row(table, row, width, top)
 
                 before = gap()
                 initial_header_page: Page | None = None
@@ -586,8 +832,16 @@ class Paginator:
                         page = new_page(i)
                         before = 0
                     width = page.width
-                    lines = self._table_row(table, row, width)
-                    repeat_needed = (header_index is not None and row > header_index
+                    grid_view = self._columns(table, width) is not None
+                    if row in header and row != header_index and grid_view:
+                        continue  # placed with the first header row
+                    lines = render(row, width)
+                    if not lines:
+                        continue  # header text that only labels records
+                    if (before and not grid_view and grid is not None
+                            and self._attached(table, grid, row)):
+                        before = 0  # a sub-row stays under its record
+                    repeat_needed = (header_index is not None and row >= header.stop
                                      and row not in table.full_width_rows)
                     repeat = header_for(width) if repeat_needed else []
                     available = H - len(page.lines) - before
@@ -600,12 +854,12 @@ class Paginator:
                             page = new_page(i)
                             before = 0
                             width = page.width
-                            lines = self._table_row(table, row, width)
+                            lines = render(row, width)
                             available = H
                     if page.lines and len(lines) > available:
                         fresh_width = (lay.full_width if len(pages) * info_per_page >= len(info_lines)
                                        else lay.narrow_width)
-                        fresh = self._table_row(table, row, fresh_width)
+                        fresh = render(row, fresh_width, top=True)
                         fresh_header = header_for(fresh_width) if repeat_needed else []
                         # Ordinary rows remain intact. Oversized rows use any
                         # remaining space; a first row may split to stay with
@@ -616,8 +870,10 @@ class Paginator:
                             page = new_page(i)
                             before = 0
                             width, lines, repeat = fresh_width, fresh, fresh_header
-                    if not page.lines and repeat:
-                        self._put(page, repeat, 0, i)
+                    if not page.lines:
+                        lines = render(row, width, top=True)
+                        if repeat:
+                            self._put(page, repeat, 0, i)
                     place_lines(lines, i, before, repeat)
                     if row == header_index:
                         initial_header_page = page

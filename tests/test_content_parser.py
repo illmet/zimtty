@@ -2,7 +2,7 @@
 import pytest
 from rich.style import Style
 
-from zimtty.zimdoc import ArticleParser, Palette
+from zimtty.zimdoc import ArticleParser, Palette, header_rows, place_cells, rule_breaks
 
 
 def parse(html):
@@ -145,16 +145,18 @@ def test_plain_table_retains_caption_cells_headers_links_and_anchors():
     assert any(span.style.meta.get("href") == "Help" for span in block.table.rows[1][1].text.spans)
 
 
-@pytest.mark.parametrize("body", [
-    '<tr><td rowspan="999999999999999999999999">Once</td><td>Second</td></tr>',
-    '<tr><td colspan="2">Once</td><td>Second</td></tr><tr><td>A</td><td>B</td><td>C</td></tr>',
-    '<tr><td>Once</td><td>Second</td></tr><tr><td>Third</td></tr>',
-    '<tr><td>Once<table><tr><td>Nested</td></tr></table>After</td><td>Second</td></tr>',
+@pytest.mark.parametrize("body,simple,aligned", [
+    ('<tr><td rowspan="999999999999999999999999">Once</td><td>Second</td></tr>', False, False),
+    ('<tr><td colspan="2">Once</td><td>Second</td></tr><tr><td>A</td><td>B</td><td>C</td></tr>',
+     True, True),
+    ('<tr><td>Once</td><td>Second</td></tr><tr><td>Third</td></tr>', True, True),
+    ('<tr><td>Once<table><tr><td>Nested</td></tr></table>After</td><td>Second</td></tr>', False, True),
 ])
-def test_complex_tables_keep_each_source_cell_once_without_expanding_spans(body):
+def test_tables_keep_each_source_cell_once(body, simple, aligned):
     article = parse(f'<table><caption>Caption</caption>{body}</table>')
     block = article.blocks[1]
-    assert block.kind == "table" and not block.table.simple
+    assert block.kind == "table"
+    assert (block.table.simple, block.table.aligned) == (simple, aligned)
     assert block.text.plain.count("Once") == 1
     assert block.text.plain.count("Second") == 1
     assert block.text.plain.count("Caption") == 1
@@ -162,6 +164,90 @@ def test_complex_tables_keep_each_source_cell_once_without_expanding_spans(body)
         assert block.text.plain.count("Nested") == block.text.plain.count("After") == 1
         assert "Once\nNested\nAfter" in block.table.rows[0][0].text.plain
     assert sum(len(row) for row in block.table.rows) <= 5
+
+
+def positions(table):
+    starts, width = place_cells(table.rows, table.full_width_rows)
+    return width, [[(cell.text.plain, start, cell.colspan, cell.rowspan)
+                    for cell, start in zip(row, row_starts)]
+                   for row, row_starts in zip(table.rows, starts)]
+
+
+def test_merged_cells_follow_the_html_table_model():
+    table = parse('''<table>
+      <tr><th rowspan="2">Name</th><th colspan="2">Term</th><th rowspan="2">Party</th></tr>
+      <tr><th>Start</th><th>End</th></tr>
+      <tr><td>Walpole</td><td>1721</td><td>1742</td><td rowspan="3">Whig</td></tr>
+      <tr><td rowspan="2">Pelham</td><td>1743</td><td>1754</td></tr>
+      <tr><td>1754</td><td>1756</td></tr></table>''').blocks[1].table
+    assert table.simple and table.aligned and not table.full_width_rows
+    assert positions(table) == (4, [
+        [("Name", 0, 1, 2), ("Term", 1, 2, 1), ("Party", 3, 1, 2)],
+        [("Start", 1, 1, 1), ("End", 2, 1, 1)],
+        [("Walpole", 0, 1, 1), ("1721", 1, 1, 1), ("1742", 2, 1, 1), ("Whig", 3, 1, 3)],
+        [("Pelham", 0, 1, 2), ("1743", 1, 1, 1), ("1754", 2, 1, 1)],
+        [("1754", 1, 1, 1), ("1756", 2, 1, 1)],
+    ])
+    assert header_rows(table.rows, table.full_width_rows) == range(0, 2)
+
+
+def test_columns_and_rows_empty_of_data_are_dropped_with_their_anchors():
+    # A nopic export: portraits are empty cells, and a party colour swatch
+    # shares a colspan="2" header with the party name.
+    article = parse('''<table>
+      <tr><th>No.</th><th>Portrait</th><th>Name</th><th colspan="2">Party</th></tr>
+      <tr><td></td><td></td><td></td><td></td><td></td></tr>
+      <tr><th>1</th><td id="first-portrait"></td><td>Washington</td>
+          <td style="background-color:#DCDCDC"></td><td>Unaffiliated</td></tr>
+      <tr><th>2</th><td></td><td>Adams</td><td style="background-color:#EA9978"></td>
+          <td>Federalist</td></tr></table>''')
+    table = article.blocks[1].table
+    assert table.simple and table.aligned
+    assert positions(table) == (3, [
+        [("No.", 0, 1, 1), ("Name", 1, 1, 1), ("Party", 2, 1, 1)],
+        [("1", 0, 1, 1), ("Washington", 1, 1, 1), ("Unaffiliated", 2, 1, 1)],
+        [("2", 0, 1, 1), ("Adams", 1, 1, 1), ("Federalist", 2, 1, 1)],
+    ])
+    assert "Portrait" not in article.blocks[1].text.plain
+    assert article.anchors["first-portrait"] == 1
+
+
+def test_rowspans_shrink_when_an_empty_row_is_dropped():
+    table = parse('''<table><tr><th>Party</th><th>Name</th></tr>
+      <tr><td rowspan="3">Whig</td><td>Walpole</td></tr>
+      <tr><td></td></tr>
+      <tr><td>Pelham</td></tr></table>''').blocks[1].table
+    assert positions(table) == (2, [
+        [("Party", 0, 1, 1), ("Name", 1, 1, 1)],
+        [("Whig", 0, 1, 2), ("Walpole", 1, 1, 1)],
+        [("Pelham", 1, 1, 1)],
+    ])
+
+
+def test_header_only_tables_have_no_header_to_label_records():
+    table = parse('<table><tr><th>Only a caption-like header</th></tr>'
+                  '<tr><td></td></tr></table>').blocks[1].table
+    assert [[cell.text.plain for cell in row] for row in table.rows] == [["Only a caption-like header"]]
+    assert header_rows(table.rows, table.full_width_rows) == range(0)
+
+
+@pytest.mark.parametrize("body", [
+    '<tr><td>A</td><td rowspan="2">B</td></tr><tr><td colspan="2">C</td></tr>',  # C overlaps B
+    '<tr><td colspan="9999">Wide</td></tr><tr><td>A</td><td>B</td></tr>',
+])
+def test_overlapping_or_oversized_spans_keep_source_order(body):
+    table = parse(f'<table>{body}</table>').blocks[1].table
+    assert not table.simple and not table.aligned and not table.full_width_rows
+    assert all(cell.colspan == cell.rowspan == 1 for row in table.rows for cell in row)
+
+
+def test_rules_between_stacked_cell_values_are_line_breaks_marked_apart_from_br():
+    article = parse('<table><tr><th>Election</th><th>Name</th></tr>'
+                    '<tr><td>1800<br><hr>1804</td><td>Thomas Jefferson<br>(1743–1826)</td></tr></table>')
+    election, name = article.blocks[1].table.rows[1]
+    assert election.text.plain == "1800\n1804" and rule_breaks(election.text) == {4}
+    assert name.text.plain == "Thomas Jefferson\n(1743–1826)" and not rule_breaks(name.text)
+    assert parse("<div>One<hr>Two</div>").blocks[1].text.plain == "One\nTwo"
 
 
 def test_full_width_table_rows_keep_position_styles_links_and_anchors():

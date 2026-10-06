@@ -6,8 +6,9 @@ from rich.console import Console
 from rich.style import Style
 from rich.text import Text
 
+import zimtty.paginate as paginate_module
 from zimtty.paginate import Layout, Paginator
-from zimtty.zimdoc import Article, Block, InfoRow, Palette, TableCell, TableData
+from zimtty.zimdoc import RULE_BREAK, Article, Block, InfoRow, Palette, TableCell, TableData
 
 
 def article(*blocks, infobox=()):
@@ -400,3 +401,161 @@ def test_full_width_preformatted_divider_preserves_whitespace_and_following_cell
     assert found["2/0"] == expanded.plain.replace("\n", "")
     assert nonspace(found["3/0"]) == "After"
     assert max(locations["2/0"]) <= min(locations["3/0"])
+
+
+def merged_block(rows, *, header_rows=1):
+    """Cells are values or (value, colspan, rowspan), keyed by source position."""
+    table_rows = []
+    expected = {}
+    for row, specs in enumerate(rows):
+        cells = []
+        for column, spec in enumerate(specs):
+            value, colspan, rowspan = (spec, 1, 1) if isinstance(spec, str) else spec
+            key = f"{row}/{column}"
+            text = Text(value, Style(meta={
+                "cell": key, "href": f"cell/{key}", "link_id": f"link/{key}",
+            }))
+            cells.append(TableCell(text, header=row < header_rows, colspan=colspan, rowspan=rowspan))
+            expected[key] = value
+        table_rows.append(cells)
+    flat = Text("\n").join(cell.text for row in table_rows for cell in row)
+    return Block("table", flat, table=TableData(table_rows, aligned=True)), expected
+
+
+def colour(pages, page, key):
+    """Colour of the first screen character showing a cell on a page."""
+    console = Console()
+    for line in pages[page].lines:
+        for offset in range(len(line.plain)):
+            style = line.get_style_at_offset(console, offset)
+            if style.meta.get("cell") == key:
+                return style.color.name if style.color else None
+    raise AssertionError(f"{key} is not on page {page}")
+
+
+PRIME_MINISTERS = [
+    [("Prime minister", 1, 2), ("Term", 2, 1), ("Mandate", 1, 2), ("Monarch", 1, 2)],
+    ["Start", "End"],
+    [("Walpole", 1, 3), ("1721", 1, 3), ("1742", 1, 3), "1722", "George I"],
+    ["1727", ("George II", 1, 3)],
+    ["1734"],
+    ["Compton", "1742", "1743", "—"],
+]
+
+
+def test_merged_header_cells_span_their_columns_and_repeat_together():
+    block, expected = merged_block([
+        [("Name", 1, 2), ("Term of office", 2, 1), ("Party", 1, 2)],
+        ["Start", "End"],
+        *[[f"Person {i}", f"{1700 + i}", f"{1701 + i}", "Whig"] for i in range(12)],
+    ], header_rows=2)
+    pages = paginate(article(block), width=60, height=9)  # repeats headers up to 3 lines
+    found, locations = tagged_cells(pages)
+    for key, value in expected.items():
+        assert nonspace(value) in nonspace(found[key])
+    first = [line.plain for line in pages[0].lines]
+    assert first[0].count("Term of office") == 1 and "Name" in first[0] and "Party" in first[0]
+    assert "Start" in first[1] and "End" in first[1] and "Term" not in first[1]
+    assert set(first[2]) == {"─"}
+    assert len(pages) > 1
+    assert locations["0/1"] == locations["1/0"] == set(range(len(pages)))
+
+
+def test_rowspan_value_shows_once_then_again_atop_each_later_page():
+    block, _ = merged_block([
+        ["Party", "Name"],
+        [("Whig", 1, 14), "Walpole"],
+        *[[f"Minister {i}"] for i in range(13)],
+        ["Tory", "Bute"],
+    ])
+    pages = paginate(article(block), width=40, height=7)  # five rows below the header
+    found, locations = tagged_cells(pages)
+    assert len(pages) == 3 and locations["1/0"] == {0, 1, 2}
+    assert nonspace(found["1/0"]) == "Whig" * 3
+    muted = Palette().muted
+    assert colour(pages, 0, "1/0") != muted
+    assert colour(pages, 1, "1/0") == colour(pages, 2, "1/0") == muted
+    for page in pages[1:3]:  # the repeated value sits on the first row of data
+        assert page.lines[2].plain.startswith("Whig")
+
+
+def test_records_label_values_by_header_rows_and_attach_sub_rows():
+    block, _ = merged_block(PRIME_MINISTERS, header_rows=2)
+    pages = paginate(article(block), width=30, height=20)
+    assert [line.plain for line in lines(pages)] == [
+        "Prime minister: Walpole",
+        "Term Start: 1721",
+        "Term End: 1742",
+        "Mandate: 1722",
+        "Monarch: George I",
+        "  Mandate: 1727 · Monarch:",
+        "    George II",
+        "  Mandate: 1734",
+        "",
+        "Prime minister: Compton",
+        "Term Start: 1742",
+        "Term End: 1743",
+        "Mandate: —",
+        "Monarch: George II",
+    ]
+
+
+def test_sub_row_starting_a_page_repeats_its_record_for_context():
+    block, _ = merged_block(PRIME_MINISTERS, header_rows=2)
+    pages = paginate(article(block), width=30, height=6)
+    top = [line.plain for line in pages[1].lines]
+    assert top[:5] == ["Prime minister: Walpole", "Term Start: 1721", "Term End: 1742",
+                       "Mandate: 1727", "Monarch: George II"]
+    assert colour(pages, 1, "2/0") == Palette().muted  # continued from the previous page
+    assert colour(pages, 1, "3/0") != Palette().muted  # this row's own value
+
+
+@pytest.mark.parametrize("width", [20, 45, 88])
+def test_merged_tables_keep_every_value_at_any_width(width):
+    block, expected = merged_block(PRIME_MINISTERS * 1, header_rows=2)
+    pages = paginate(article(block), width=width, height=8)
+    found, _ = tagged_cells(pages)
+    for key, value in expected.items():
+        assert nonspace(value) in nonspace(found[key])
+
+
+def test_merged_value_without_a_common_header_lists_its_columns():
+    block, _ = merged_block([["Start", "End", "Party"], [("1721–1742", 2, 1), "Whig"],
+                             ["1742", "1743", "Whig"]])
+    pages = paginate(article(block), width=30, height=12)
+    rendered = [line.plain for line in lines(pages)]
+    assert "Start / End: 1721–1742" in rendered and "Start: 1742" in rendered
+
+
+def test_record_values_flow_line_breaks_but_keep_stacked_values_and_lists_apart():
+    def cell(text, header=False):
+        return TableCell(text if isinstance(text, Text) else Text(text), header=header)
+
+    stacked = Text("Burr") + Text("\n", RULE_BREAK) + Text("Clinton")
+    table = TableData([
+        [cell(name, header=True) for name in ("Term", "Party", "VP", "Offices")],
+        [cell("1801\n–\n1809"), cell("Democratic-\nRepublican"), cell(stacked),
+         cell("• Treasury\n• Exchequer")],
+    ])
+    pages = paginate(article(Block("table", Text(""), table=table)), width=31, height=10)
+    assert [line.plain for line in lines(pages)] == [
+        "Term: 1801 – 1809",
+        "Party: Democratic-Republican",
+        "VP: Burr · Clinton",
+        "Offices: • Treasury",
+        "  • Exchequer",
+    ]
+
+
+def test_running_text_is_never_squeezed_into_a_narrow_grid_column(monkeypatch):
+    block, _ = table_block([
+        ["Year", "Laureate", "Nationality", "Rationale"],
+        *[[str(1901 + i), "Wilhelm Röntgen", "German",
+           "in recognition of the extraordinary services he has rendered by the discovery"]
+          for i in range(3)],
+    ])
+    assert Paginator(Palette())._columns(block.table, 45) is None
+    widths = Paginator(Palette())._columns(block.table, 88)
+    assert widths is not None and widths[3] >= 14
+    monkeypatch.setattr(paginate_module, "TEXT_COLUMN", 0)
+    assert Paginator(Palette())._columns(block.table, 45) is not None

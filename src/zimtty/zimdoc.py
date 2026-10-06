@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from itertools import count
+from itertools import accumulate, count
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
 from libzim.reader import Archive
@@ -27,16 +27,21 @@ class TableCell:
     text: Text
     header: bool = False
     preformatted: bool = False
+    colspan: int = 1  # grid columns covered, after empty columns are removed
+    rowspan: int = 1  # rows covered, never past the end of the table
 
 
 @dataclass
 class TableData:
-    rows: list[list[TableCell]]
+    rows: list[list[TableCell]]  # source cells in document order, each once
     caption: Text = field(default_factory=Text)
-    simple: bool = True
-    # Explicit single-cell rows spanning an otherwise rectangular grid. Keep
-    # their original positions; no expansion or inference of other merged cells.
+    simple: bool = True  # may be shown as a grid of columns
+    # Single-cell rows spanning every column (titles, section bands, notes).
     full_width_rows: frozenset[int] = frozenset()
+    # Spans were validated, so cells line up in columns even when the grid is
+    # not allowed (nested tables). Simple tables are always aligned; others
+    # keep source order without inferring header labels.
+    aligned: bool = False
 
 
 @dataclass
@@ -97,6 +102,11 @@ class Palette:
 MAX_ARTICLE_BYTES = 16 * 1024 * 1024
 MAX_DOM_DEPTH = 128
 MAX_TEX_DEPTH = 64
+# Tables follow the HTML table model only within these bounds; wider or
+# overlapping layouts keep their cells in source order instead.
+MAX_TABLE_COLUMNS = 128
+MAX_TABLE_SLOTS = 250_000
+MAX_HEADER_ROWS = 3
 
 
 class ArticleError(ValueError):
@@ -123,6 +133,124 @@ def _check_dom_depth(tree: HTMLParser) -> None:
                 f"Article HTML exceeds the maximum nesting depth of {MAX_DOM_DEPTH}."
             )
         stack.append(iter(node.iter()))
+
+
+def place_cells(rows: list[list[TableCell]],
+                bands: frozenset[int] = frozenset()) -> tuple[list[list[int]], int] | None:
+    """Start column of every cell under the HTML table model, and the width.
+
+    Bands occupy no columns. Overlapping cells, or grids beyond the column and
+    slot bounds, return None so callers keep source order instead of guessing.
+    """
+    busy: list[int] = []  # per column: the first row no longer covered from above
+    starts: list[list[int]] = []
+    for r, row in enumerate(rows):
+        if r in bands:
+            starts.append([0] * len(row))
+            continue
+        column = 0
+        placed = []
+        for cell in row:
+            while column < len(busy) and busy[column] > r:
+                column += 1
+            end = column + cell.colspan
+            if end > MAX_TABLE_COLUMNS:
+                return None
+            busy.extend([0] * (end - len(busy)))
+            if any(busy[c] > r for c in range(column, end)):
+                return None
+            busy[column:end] = [r + cell.rowspan] * cell.colspan
+            placed.append(column)
+            column = end
+        starts.append(placed)
+    if len(busy) * len(rows) > MAX_TABLE_SLOTS:
+        return None
+    return starts, len(busy)
+
+
+def header_rows(rows: list[list[TableCell]], bands: frozenset[int] = frozenset()) -> range:
+    """Leading rows made only of header cells, after any title bands.
+
+    A run longer than MAX_HEADER_ROWS keeps only its first row. Without data
+    rows below it there is nothing to label, so there is no header.
+    """
+    start = 0
+    while start in bands:
+        start += 1
+    end = start
+    while (end < len(rows) and end not in bands and rows[end]
+           and all(cell.header for cell in rows[end])):
+        end += 1
+    if not any(r not in bands for r in range(end, len(rows))):
+        return range(start, start)
+    return range(start, start + 1 if end - start > MAX_HEADER_ROWS else end)
+
+
+def rule_breaks(text: Text) -> set[int]:
+    """Offsets of the line breaks in text that came from <hr>."""
+    return {span.start for span in text.spans if span.style == RULE_BREAK}
+
+
+def _span(cell: Node, name: str) -> int | None:
+    """A positive span of at most four digits; None marks malformed markup."""
+    raw = (cell.attributes.get(name, "1") or "").strip()
+    if len(raw) <= 4 and raw.isascii() and raw.isdecimal() and int(raw) > 0:
+        return int(raw)
+    return None
+
+
+def _align(rows: list[list[TableCell]]) -> frozenset[int] | None:
+    """Fit spans to the HTML table model, dropping columns that are empty in
+    every data row (stripped portraits, colour swatches, spacer columns).
+
+    Rewrites spans and removes emptied cells and rows in place. Returns the
+    full-width bands, or None when the cells cannot be placed in a grid.
+    """
+    for r, row in enumerate(rows):
+        for cell in row:
+            cell.rowspan = min(cell.rowspan, len(rows) - r)
+    placed = place_cells(rows)
+    if placed is None:
+        return None
+    starts, width = placed
+    bands = frozenset(r for r, row in enumerate(rows) if len(row) == 1 and row[0].colspan == width)
+    head = header_rows(rows, bands)
+    used = [False] * width
+    spanning = []
+    for r, row in enumerate(rows):
+        if r in head:
+            continue
+        for cell, start in zip(row, starts[r]):
+            if not cell.text.plain.strip():
+                continue
+            if cell.colspan == 1:
+                used[start] = True
+            else:
+                spanning.append((start, start + cell.colspan))
+    for start, end in spanning:  # a merged value keeps at least one column
+        if not any(used[start:end]):
+            used[start] = True
+    if any(used) and not all(used):
+        before = list(accumulate(used, initial=0))  # used columns left of each
+        for row, row_starts in zip(rows, starts):
+            for cell, start in zip(row, row_starts):
+                cell.colspan = before[start + cell.colspan] - before[start]
+    for row in rows:
+        row[:] = [cell for cell in row if cell.colspan]
+        if all(cell.rowspan == 1 and not cell.text.plain.strip() for cell in row):
+            row.clear()  # spacer rows, or rows that only held an image
+    kept = list(accumulate((bool(row) for row in rows), initial=0))
+    for r, row in enumerate(rows):
+        for cell in row:
+            cell.rowspan = kept[r + cell.rowspan] - kept[r]
+    rows[:] = [row for row in rows if row]
+    placed = place_cells(rows)
+    if placed is None:  # defensive: compaction preserves the layout
+        return None
+    starts, width = placed
+    return frozenset(r for r, row in enumerate(rows)
+                     if width > 1 and len(row) == 1 and row[0].colspan == width
+                     and row[0].rowspan == 1)
 
 
 # Blocks we never show in the reading view.
@@ -159,6 +287,8 @@ NOTES_TITLE = "Additional notes"
 
 WS = re.compile(r"[ \t\r\n\f\u00a0]+")
 INVISIBLE = str.maketrans("", "", "\u200b\u2060\ufeff\u00ad")
+# Marks a line break from <hr>: stacked separate values, not one wrapped value.
+RULE_BREAK = Style(meta={"break": "rule"})
 
 
 def classes(node: Node) -> set[str]:
@@ -356,8 +486,8 @@ class InlineBuilder:
             self._visit(node, None)
         return self._finish()
 
-    def _brk(self):
-        self.segs.append(("\n", None))
+    def _brk(self, style: Style | None = None):
+        self.segs.append(("\n", style))
 
     def _walk(self, node: Node, style: Style | None):
         for ch in node.iter(include_text=True):
@@ -379,8 +509,8 @@ class InlineBuilder:
             if self.show_refs:
                 self.segs.append((ch.text(strip=True), Style(color=self.pal.muted, dim=True)))
             return
-        if tag == "br":
-            self._brk()
+        if tag in ("br", "hr"):
+            self._brk(RULE_BREAK if tag == "hr" else None)
             return
         if tag == "a":
             href = ch.attributes.get("href") or ""
@@ -432,7 +562,9 @@ class InlineBuilder:
             s = safe_text(s)
             if s == "\n":
                 if not at_line_start:
-                    out.append("\n")
+                    out.append("\n", st)
+                elif st is not None and out.plain.endswith("\n"):
+                    out.stylize(st, len(out) - 1, len(out))  # <br><hr>: keep the rule
                 at_line_start, pending_space = True, False
                 continue
             parts = WS.split(s)
@@ -712,47 +844,38 @@ class ArticleParser:
         cap = next((child for child in node.iter() if child.tag == "caption"), None)
         caption = self.inline(cap, boxy=True) if cap is not None else Text()
         rows: list[list[TableCell]] = []
-        spans: list[list[int]] = []
-        simple = True
+        well_formed = True
+        nested = False
         for row in self._direct_rows(node):
             if self._skip(row):
                 continue
             cells: list[TableCell] = []
-            row_spans: list[int] = []
             for cell in row.iter():
                 if cell.tag not in ("td", "th") or self._skip(cell):
                     continue
-                raw_span = cell.attributes.get("colspan", "1") or ""
                 # Bound parsing as well as rendering; large/malformed spans
                 # stay in the source-order fallback without allocating a grid.
-                span = int(raw_span) if (len(raw_span) <= 4 and raw_span.isascii()
-                                         and raw_span.isdecimal()) else 0
-                row_spans.append(span)
-                if (cell.css_first("table") is not None
-                        or cell.attributes.get("rowspan", "1") != "1"
-                        or span < 1):
-                    simple = False
+                colspan, rowspan = _span(cell, "colspan"), _span(cell, "rowspan")
+                well_formed = well_formed and colspan is not None and rowspan is not None
+                nested = nested or cell.css_first("table") is not None
                 parts: list[Block] = []
                 self._walk(cell, parts, in_lead=False, content_only=True)
                 preformatted = any(block.kind == "pre" or
                                    (block.table is not None and any(c.preformatted for r in block.table.rows for c in r))
                                    for block in parts)
                 cells.append(TableCell(Text("\n").join(block.text for block in parts),
-                                       cell.tag == "th", preformatted=preformatted))
+                                       cell.tag == "th", preformatted=preformatted,
+                                       colspan=colspan or 1, rowspan=rowspan or 1))
             if cells:
                 rows.append(cells)
-                spans.append(row_spans)
-        full_width_rows: set[int] = set()
-        count = max((len(row) for row in rows), default=0)
-        for index, row_spans in enumerate(spans):
-            if len(row_spans) == count and all(span == 1 for span in row_spans):
-                continue
-            if count > 1 and row_spans == [count]:
-                full_width_rows.add(index)
-            else:
-                simple = False
-        return TableData(rows, caption, simple,
-                         frozenset(full_width_rows) if simple else frozenset())
+        bands = _align(rows) if well_formed else None
+        if bands is None:
+            for row in rows:
+                for cell in row:
+                    cell.colspan = cell.rowspan = 1
+        aligned = bands is not None
+        return TableData(rows, caption, simple=aligned and not nested,
+                         full_width_rows=bands or frozenset(), aligned=aligned)
 
     def _list(self, lst: Node, out: list[Block], depth: int, indent: int = 0,
               content_only: bool = False) -> tuple[str, ...]:
