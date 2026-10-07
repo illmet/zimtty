@@ -15,9 +15,9 @@ def article(*blocks, infobox=()):
     return Article("test", "Test", list(blocks), list(infobox), [])
 
 
-def paginate(document, width=40, height=8, narrow=None, info_width=0):
+def paginate(document, width=40, height=8, narrow=None, info_width=0, expanded=False):
     pages = Paginator(Palette()).paginate(
-        document, Layout(height, width, narrow or width, info_width), set()
+        document, Layout(height, width, narrow or width, info_width), set(), expanded
     )
     for page in pages:
         assert len(page.lines) <= height
@@ -261,11 +261,14 @@ def test_infobox_remains_readable_with_or_without_sidebar(sidebar):
     value.stylize(Style(meta={"cell": "info", "href": "cell/info", "link_id": "link/info"}))
     info = [InfoRow("title", None, Text("Details")), InfoRow("pair", Text("Label"), value)]
     block = Block("infobox", Text("Details Label ") + value)
-    pages = paginate(article(Block("para", Text("Before")), block,
-                             Block("para", Text("After")), infobox=info),
-                     width=40 if sidebar else 20, narrow=20, height=6,
-                     info_width=15 if sidebar else 0)
+    document = article(Block("para", Text("Before")), block, Block("para", Text("After")), infobox=info)
+    options = dict(width=40 if sidebar else 20, narrow=20, height=6, info_width=15 if sidebar else 0)
+    # In the text the infobox is folded to a card until expanded; expanded, it is whole.
+    pages = paginate(document, **options, expanded=True)
     if sidebar:
+        # The side box always shows everything: expanding changes nothing.
+        assert [(page.lines, page.info) for page in pages] == [
+            (page.lines, page.info) for page in paginate(document, **options)]
         assert all("meaningful" not in line.plain for line in lines(pages))
         info_pages = [type(page)(page.info, [], False, 0, 15) for page in pages]
         found, _ = tagged_cells(info_pages)
@@ -274,6 +277,109 @@ def test_infobox_remains_readable_with_or_without_sidebar(sidebar):
         found, _ = tagged_cells(pages)
         assert 1 in set.union(*(page.blocks for page in pages))
     assert nonspace(found["info"]) == nonspace(value.plain)
+
+
+SECTIONS = [InfoRow("title", None, Text("Thing")),
+            InfoRow("pair", Text("Born"), Text("1900")),
+            InfoRow("pair", Text("Died"), Text("1990")),
+            InfoRow("header", None, Text("Career")),
+            InfoRow("pair", Text("Known for"), Text("Things")),
+            InfoRow("pair", Text("Awards"), Text("Several"))]
+
+
+def info_article(rows, *before):
+    return article(*before, Block("para", Text("Intro.")), Block("infobox", Text("Box")),
+                   Block("para", Text("After.")), infobox=rows)
+
+
+def boxes(pages):
+    """Each page's framed lines."""
+    return [[line.plain for line in page.lines if line.plain.startswith(("┌", "│", "└"))] for page in pages]
+
+
+def test_infobox_in_the_text_is_a_framed_card_of_its_first_section():
+    pages = paginate(info_article(SECTIONS), width=30, height=20)
+    assert boxes(pages) == [[
+        "┌────────────────────────────┐",
+        "│           Thing            │",
+        "│ Born      1900             │",
+        "│ Died      1990             │",
+        "└───────── 4 more lines · i ─┘",
+    ]]
+    assert [line.plain for line in pages[0].lines][:2] == ["Intro.", ""]
+    assert pages[0].folded == 4
+    frame = Style(color=Palette().frame)
+    edge, row = pages[0].lines[2], pages[0].lines[4]
+    assert edge.get_style_at_offset(Console(), 0) == frame
+    assert row.get_style_at_offset(Console(), 0) == frame
+    assert row.get_style_at_offset(Console(), 2).color.name == Palette().muted  # the label
+
+    expanded = paginate(info_article(SECTIONS), width=30, height=20, expanded=True)
+    assert boxes(expanded) == [[
+        "┌────────────────────────────┐",
+        "│           Thing            │",
+        "│ Born      1900             │",
+        "│ Died      1990             │",
+        "│                            │",
+        "│ Career                     │",
+        "│ Known for Things           │",
+        "│ Awards    Several          │",
+        "└───────────── collapse · i ─┘",
+    ]]
+    assert not any(page.folded for page in expanded)
+
+
+def test_card_label_shortens_to_fit_a_narrow_box():
+    pages = paginate(info_article(SECTIONS), width=20, height=20)
+    assert 0 < pages[0].folded < 10
+    assert boxes(pages)[0][-1] == "└" + "─" * 9 + f" +{pages[0].folded} · i " + "─┘"
+
+
+def test_whole_infobox_card_has_no_expansion_label():
+    pages = paginate(info_article(SECTIONS[:3]), width=30, height=20)
+    assert boxes(pages)[0][-1] == "└" + "─" * 28 + "┘"
+    assert boxes(paginate(info_article(SECTIONS[:3]), width=30, height=20, expanded=True)) == boxes(pages)
+    assert pages[0].folded == 0
+
+
+def test_expanded_infobox_continues_across_pages_with_labelled_edges():
+    rows = [InfoRow("title", None, Text("Thing"))] + [
+        InfoRow("pair", Text(f"Field {k}"), Text(f"value {k}")) for k in range(20)]
+    pages = paginate(info_article(rows), width=30, height=10, expanded=True)
+    parts = [part for part in boxes(pages) if part]
+    assert len(parts) == 3
+    assert [part[0] for part in parts] == [
+        "┌────────────────────────────┐",
+        "┌─ ↑ continued ──────────────┐",
+        "┌─ ↑ continued ──────────────┐"]
+    assert [part[-1] for part in parts] == [
+        "└────────────── continues ↓ ─┘",
+        "└────────────── continues ↓ ─┘",
+        "└───────────── collapse · i ─┘"]
+    fields = [line.split()[2] for part in parts for line in part if "Field" in line]
+    assert fields == [str(k) for k in range(20)]
+    assert all(line.cell_len == 30 for page in pages for line in page.lines
+               if line.plain.startswith(("┌", "│", "└")))
+
+
+def test_card_moves_whole_while_a_long_expanded_box_uses_the_room_left():
+    rows = [InfoRow("title", None, Text("Thing"))] + [
+        InfoRow("pair", Text(f"Field {k}"), Text(f"value {k}")) for k in range(20)]
+    six = Block("para", Text("Filler words. " * 12))  # six lines at width 30
+    two = Block("para", Text("Filler words. " * 4))
+    # Below six lines and the intro, three lines remain: the card (four rows
+    # and its edges) moves whole to the next page, and so does the expanded
+    # box rather than leaving a sliver. Seven lines are room to begin it.
+    assert [len(part) for part in boxes(paginate(info_article(rows, six), width=30, height=12))][:2] == [0, 6]
+    assert boxes(paginate(info_article(rows, six), width=30, height=12, expanded=True))[0] == []
+    assert len(boxes(paginate(info_article(rows, two), width=30, height=12, expanded=True))[0]) == 7
+
+
+def test_heading_stays_with_the_infobox_card_that_follows_it():
+    document = article(Block("para", Text("Filler words. " * 14)), Block("h3", Text("Details")),
+                       Block("infobox", Text("Box")), Block("para", Text("After.")), infobox=SECTIONS)
+    pages = paginate(document, width=30, height=12)
+    assert [line.plain for line in pages[1].lines][:3] == ["Details", "", "┌" + "─" * 28 + "┐"]
 
 
 def test_late_infobox_anchor_marks_actual_sidebar_pages():

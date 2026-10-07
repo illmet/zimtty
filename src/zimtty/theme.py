@@ -99,6 +99,8 @@ def build(c: dict) -> tuple[Palette, Theme]:
         link=rgb["blue"],
         heading=rgb["bright_foreground"],
         sub=rgb["accent"],
+        # The side box's border is "$accent 60%"; inline boxes match it.
+        frame=Color.parse(c["background"]).blend(Color.parse(accent), 0.6).hex6.lower(),
     )
     theme = Theme(
         name="omarchy",

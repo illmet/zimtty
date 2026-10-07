@@ -9,6 +9,9 @@ Rules (agreed design):
   * every h2 (and any heading the user jumped to via the TOC) starts a page
   * the infobox sits in its own box on the right; if it is taller than a
     page it continues on the next page; once it runs out the text goes full width
+  * without room for that box, the infobox is framed in the text, folded to
+    a card of its first section; expanded, it continues across pages like
+    the side box
   * table rows stay whole unless taller than a page; header rows repeat on
     each page of a grid, and a merged cell continuing onto a new page is
     repeated (muted) on its first row
@@ -37,6 +40,7 @@ NUMBER_TOKEN = re.compile(r"(?<![\w.])[+−-]?\d+(?:[,.]\d+)*(?:[%‰])?(?![\w.]
 LIST_ITEM = re.compile(r"[•◦]|\d+\. ")  # list markers added by the parser
 RUNNING_TEXT = 40  # average longest line of the values in a column of sentences
 TEXT_COLUMN = 14  # narrowest grid column for running text
+INFO_CARD = 12  # most lines of an infobox card in the text (and at most a third of a page)
 
 
 def wrap(text: Text, width: int) -> list[Text]:
@@ -261,6 +265,7 @@ class Page:
     first_block: int
     width: int
     blocks: set[int] = field(default_factory=set)
+    folded: int = 0  # infobox lines left out of the card on this page
 
 
 @dataclass
@@ -278,6 +283,7 @@ class Paginator:
         self._table_widths: dict[tuple[int, int], list[int] | None] = {}
         self._grids: dict[int, _Grid | None] = {}
         self._rows: dict[tuple[int, int, int, bool], list[Text]] = {}
+        self._box_height: int | None = None  # the infobox framed in the text
 
     # ---------------------------------------------------------- rendering
 
@@ -341,6 +347,8 @@ class Paginator:
 
     def _following_height(self, b: Block, width: int, limit: int) -> int:
         """Measure enough of the next block to decide heading placement."""
+        if b.kind == "infobox" and self._box_height is not None:
+            return min(limit, self._box_height)
         if b.kind == "pre":
             pad = min(b.indent, max(width // 4, 0), max(width - 4, 0))
             return len(_PreFlow(b.text).take(width - pad, limit))
@@ -621,8 +629,13 @@ class Paginator:
         return out
 
     def render_info(self, rows: list[InfoRow], width: int) -> list[Text]:
+        return self._info_lines(rows, width)[0]
+
+    def _info_lines(self, rows: list[InfoRow], width: int) -> tuple[list[Text], list[int]]:
+        """The infobox's lines, and the number of lines through each row."""
         pal = self.pal
         out: list[Text] = []
+        ends: list[int] = []
         # label column: fits the longest label *word* so nothing is split mid-word
         # ("Presiden/t"), capped at 45% of the box; longer words overflow onto
         # their own full-width line instead. Short labels like "Preceded by"
@@ -675,26 +688,82 @@ class Paginator:
                     # label word too long for the column: label on its own line
                     out.extend(wrap(lab, width))
                     out.extend(Text(" " * (lw + 1)) + v for v in vl)
-                    continue
-                ind = len(lab.plain) - len(lab.plain.lstrip())
-                if ind:  # sub-row: keep wrapped label lines indented too
-                    ll = [Text(" " * ind) + x for x in wrap(lab[ind:], lw - ind)]
                 else:
-                    ll = wrap(lab, lw)
-                for i in range(max(len(ll), len(vl))):
-                    a = ll[i].copy() if i < len(ll) else Text("")
-                    a.pad_right(lw - a.cell_len)
-                    out.append(a + Text(" ") + (vl[i] if i < len(vl) else Text("")))
-            else:  # full-width row; an empty one is a deliberate gap
-                if not r.value.plain.strip():
-                    if out and out[-1].plain:
-                        out.append(Text(""))
-                    continue
+                    ind = len(lab.plain) - len(lab.plain.lstrip())
+                    if ind:  # sub-row: keep wrapped label lines indented too
+                        ll = [Text(" " * ind) + x for x in wrap(lab[ind:], lw - ind)]
+                    else:
+                        ll = wrap(lab, lw)
+                    for i in range(max(len(ll), len(vl))):
+                        a = ll[i].copy() if i < len(ll) else Text("")
+                        a.pad_right(lw - a.cell_len)
+                        out.append(a + Text(" ") + (vl[i] if i < len(vl) else Text("")))
+            elif not r.value.plain.strip():  # an empty full-width row is a deliberate gap
+                if out and out[-1].plain:
+                    out.append(Text(""))
+            else:  # full-width row
                 for part in r.value.split("\n"):
                     if part.plain.strip():
                         out.extend(wrap(part, width))
+            ends.append(len(out))
         while out and not out[-1].plain.strip():
             out.pop()
+        return out, ends
+
+    def _info_box(self, rows: list[InfoRow], width: int, budget: int) -> tuple[list[Text], int]:
+        """The infobox's lines, and how many of them make its card: whole rows
+        of the first section (up to a header after some labelled fields; an
+        image caption is not one), within budget."""
+        lines, ends = self._info_lines(rows, width)
+        card = 0
+        fields = False
+        for row, end in zip(rows, ends):
+            end = min(end, len(lines))
+            if (row.kind == "header" and fields) or (end > budget and card):
+                break
+            card = end
+            fields = fields or row.kind == "pair"
+        card = min(card, budget)
+        while card and not lines[card - 1].plain.strip():
+            card -= 1
+        return lines, card
+
+    def _frame(self, lines: list[Text], width: int, top: str | None = None,
+               bottom: str | tuple[str, ...] | None = None) -> list[Text]:
+        """Lines boxed like the side box: a label sits in the top edge at the
+        left and in the bottom edge at the right. Of several labels, the
+        first that fits is used."""
+        border = Style(color=self.pal.frame)
+
+        def edge(left: str, right: str, labels: str | tuple[str, ...] | None, start: bool) -> Text:
+            out = Text()
+            out.append(left, border)
+            fill = width - 2
+            labels = (labels,) if isinstance(labels, str) else labels or ()
+            label = next((label for label in labels if cell_len(label) + 4 <= fill), None)
+            if label:
+                rest = fill - cell_len(label) - 3
+                out.append("─" * (1 if start else rest), border)
+                out.append(f" {label} ", Style(color=self.pal.muted))
+                out.append("─" * (rest if start else 1), border)
+            else:
+                out.append("─" * fill, border)
+            out.append(right, border)
+            return out
+
+        inner = width - 4
+        out = [edge("┌", "┐", top, True)]
+        for line in lines:
+            if line.cell_len > inner:
+                line = line.copy()
+                line.truncate(inner)
+            row = Text()
+            row.append("│ ", border)
+            row.append_text(line)
+            row.append(" " * (inner - line.cell_len))
+            row.append(" │", border)
+            out.append(row)
+        out.append(edge("└", "┘", bottom, False))
         return out
 
     # ---------------------------------------------------------- pagination
@@ -717,7 +786,10 @@ class Paginator:
         head.rstrip()
         return head, t[cuts[best]:]
 
-    def paginate(self, art: Article, lay: Layout, breaks: set[int]) -> list[Page]:
+    def paginate(self, art: Article, lay: Layout, breaks: set[int],
+                 info_expanded: bool = False) -> list[Page]:
+        """info_expanded: an infobox framed in the text is shown in full
+        instead of folded to its card."""
         self._cache = {}
         self._table_widths = {}
         self._grids = {}
@@ -725,6 +797,12 @@ class Paginator:
         H = max(lay.height, 4)
         info_lines = self.render_info(art.infobox, lay.info_width) if (art.infobox and lay.info_width) else []
         info_per_page = max(H - 2, 1)  # box border takes 2 rows
+        box: list[Text] = []  # without a side box, the infobox is framed in the text
+        card = 0
+        if art.infobox and not lay.info_width:
+            box, card = self._info_box(art.infobox, lay.full_width - 4, max(1, min(INFO_CARD, H // 3)))
+        shown = box if info_expanded else box[:card]
+        self._box_height = None if lay.info_width else len(shown) + 2 * bool(shown)
 
         pages: list[Page] = []
 
@@ -760,6 +838,31 @@ class Paginator:
                 offset += len(chunk)
                 before = 0
 
+        def place_box(block: int, before: int) -> None:
+            """Frame the infobox in the text. A card stays whole; the expanded
+            box continues across pages with edges labelled like the side box."""
+            nonlocal page
+            folded = len(box) - len(shown)
+            last = ((f"{folded} more lines · i", f"+{folded} · i") if folded
+                    else "collapse · i" if card < len(box) else None)
+            available = H - len(page.lines) - before
+            if (page.lines and len(shown) + 2 > available
+                    and (len(shown) + 2 <= H or available < 6)):
+                page = new_page(block)
+                before = 0
+            offset = 0
+            while offset < len(shown):
+                if offset:
+                    page = new_page(block)
+                    before = 0
+                part = shown[offset:offset + max(H - len(page.lines) - before - 2, 1)]
+                offset += len(part)
+                self._put(page, self._frame(part, page.width,
+                                            "↑ continued" if offset > len(part) else None,
+                                            "continues ↓" if offset < len(shown) else last),
+                          before, block)
+            page.folded = folded
+
         for i, b in enumerate(blocks):
             is_heading = b.kind in HEADINGS
             forced = (b.kind == "h2" or i in breaks) and i != 0
@@ -773,8 +876,8 @@ class Paginator:
                 return 0 if (b.kind in TIGHT and prev_kind == b.kind) else 1
 
             if b.kind == "infobox":
-                if not lay.info_width:
-                    place_lines(self.render_info(art.infobox, page.width), i, gap())
+                if shown:
+                    place_box(i, gap())
                     prev_kind = b.kind
                 continue
 
