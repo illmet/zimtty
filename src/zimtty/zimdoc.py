@@ -91,6 +91,7 @@ class Palette:
     link: str = "#7aa2f7"
     heading: str = "#ffffff"
     sub: str = "#bb9af7"
+    frame: str = "#536ca3"  # box borders: the accent at 60% over the background
 
 
 # ---------------------------------------------------------------- constants
@@ -628,6 +629,7 @@ class ArticleParser:
                 top[-1][1].append(b)
             else:
                 lead.append(b)
+        self._lead_first(lead)
         if mediawiki or self.notes:
             main = [(h, b) for h, b in top if h.text.plain.strip().lower() not in BACK_MATTER]
             back = [(h, b) for h, b in top if h.text.plain.strip().lower() in BACK_MATTER]
@@ -654,6 +656,23 @@ class ArticleParser:
             if b.kind in ("h2", "h3", "h4"):
                 art.toc.append(TocEntry(i, int(b.kind[1]), b.text.plain, b.anchor))
         return art
+
+    @staticmethod
+    def _lead_first(lead: list[Block]) -> None:
+        """Open with the first lead paragraph when the infobox precedes it, as
+        Wikipedia's mobile site does, so an infobox in the text no longer
+        delays the article by pages. The paragraph crosses only tables
+        (companion boxes such as ratings or standings, which then follow it at
+        any width), never a heading or the list it would continue."""
+        box = next((i for i, b in enumerate(lead) if b.kind == "infobox"), None)
+        if box is None or any(b.kind == "para" for b in lead[:box]):
+            return
+        for i in range(box + 1, len(lead)):
+            if lead[i].kind == "para" and not lead[i].indent:
+                lead.insert(box, lead.pop(i))
+                return
+            if lead[i].kind != "table":
+                return
 
     @staticmethod
     def _drop_empty_headings(blocks: list[Block]) -> list[Block]:

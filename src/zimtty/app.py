@@ -180,6 +180,7 @@ class ZimTTY(App):
         Binding("N", "link_step(-1)", "previous link", show=False),
         Binding("enter", "link_open", "open link", show=False),
         Binding("a", "notes", "additional notes", show=False),
+        Binding("i", "info", "infobox", show=False),
         Binding("s", "toggle_refs", "citations", show=False),
         Binding("R", "random", "random", show=False),
         Binding("question_mark", "help", "help", show=False),
@@ -220,6 +221,7 @@ class ZimTTY(App):
         self._query_id = 0
         self._open_on_results: str | None = None
         self.plain_links = False  # 'l': hide link styling and disable following
+        self.info_expanded = False  # 'i': this article's infobox in full instead of its card
         self.link_sel: int | None = None  # n/N: index into this page's link targets
         self._help_timer = None
 
@@ -326,7 +328,9 @@ class ZimTTY(App):
                 breaks = set(page_breaks)
             else:
                 breaks = {block} if block and article.blocks[block].kind != "infobox" else set()
-            pages = Paginator(self.pal).paginate(article, self._layout(), breaks)
+            # An expanded infobox stays open within its article, not across articles.
+            expanded = self.info_expanded and self.article is not None and self.article.path == path
+            pages = Paginator(self.pal).paginate(article, self._layout(), breaks, expanded)
         except (OSError, RuntimeError, ValueError, KeyError) as error:
             # Includes bounded-parser ArticleError and defensive RecursionError.
             self._article_error(error)
@@ -334,6 +338,7 @@ class ZimTTY(App):
         if push:
             self._remember()  # must happen before the new article replaces self.pages
         self.article = article
+        self.info_expanded = expanded
         self.breaks = breaks
         self._fill_toc()
         self._set_pages(pages, block, page_offset)
@@ -397,7 +402,8 @@ class ZimTTY(App):
             place = self._current_place()
             anchor_block, page_offset = place.block, place.page_offset
         try:
-            pages = Paginator(self.pal).paginate(self.article, self._layout(), self.breaks)
+            pages = Paginator(self.pal).paginate(self.article, self._layout(), self.breaks,
+                                                 self.info_expanded)
         except (RuntimeError, ValueError) as error:
             self._article_error(error)
             return
@@ -547,13 +553,33 @@ class ZimTTY(App):
                 return
         self.notify("no additional notes on this article", timeout=2)
 
+    def action_info(self):
+        """Expand the infobox framed in the text, or collapse it back to its card."""
+        if not self.article:
+            return
+        block = next((i for i, b in enumerate(self.article.blocks) if b.kind == "infobox"), None)
+        if block is None or not self.article.infobox:
+            self.notify("no infobox on this article", timeout=1.5)
+            return
+        if self._layout().info_width:
+            self.notify("the infobox is shown beside the text", timeout=1.5)
+            return
+        if not self.info_expanded and not any(page.folded for page in self.pages):
+            self.notify("the whole infobox is shown", timeout=1.5)
+            return
+        self.info_expanded = not self.info_expanded
+        # Expanding shows the box from its start; collapsing keeps the reading place.
+        self._repaginate(anchor_block=block if self.info_expanded else None)
+        self.notify("infobox expanded" if self.info_expanded else "infobox collapsed", timeout=1.5)
+
     def _reload_keep_place(self) -> bool:
         """Re-parse the current article (after a display toggle), same page."""
         if self.article:
             place = self._current_place()
             try:
                 article = self._read_article(self.article.path)
-                pages = Paginator(self.pal).paginate(article, self._layout(), self.breaks)
+                pages = Paginator(self.pal).paginate(article, self._layout(), self.breaks,
+                                                     self.info_expanded)
             except (OSError, RuntimeError, ValueError, KeyError) as error:
                 self._article_error(error)
                 return False
@@ -590,6 +616,7 @@ class ZimTTY(App):
         "f                         follow a link by label\n"
         "← / →  backspace          back / forward\n"
         "a                         additional notes\n"
+        "i                         expand / collapse the infobox\n"
         "l                         links off / on\n"
         "s                         citation markers\n"
         "R                         random article\n"

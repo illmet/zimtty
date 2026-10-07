@@ -292,11 +292,40 @@ def test_infobox_has_inline_fallback_and_later_infoboxes_are_not_dropped():
     article = parse('''<h1>Guide</h1><table class="infobox" id="first-info">
       <tr><th>Name</th><td id="first-value">First</td></tr></table><p>Between.</p>
       <table class="infobox" id="second-info"><tr><th>Name</th><td>Second</td></tr></table>''')
-    first, second = article.blocks[1], article.blocks[3]
+    first, second = article.blocks[2], article.blocks[3]
     assert first.kind == "infobox" and "First" in first.text.plain
     assert second.kind == "table" and "Second" in second.text.plain
-    assert article.anchors["first-info"] == article.anchors["first-value"] == 1
+    assert article.anchors["first-info"] == article.anchors["first-value"] == 2
     assert article.anchors["second-info"] == 3
+
+
+def test_first_lead_paragraph_moves_before_the_infobox_and_its_companion_tables():
+    article = parse('''<h1>Guide</h1><table class="infobox" id="box"><tr><th>Born</th><td>1900</td></tr></table>
+      <table id="names"><tr><th>Native name</th><td>Name</td></tr></table>
+      <p id="intro">Introduction.</p><p>Second.</p><h2 id="Part">Part</h2><p>Body.</p>''')
+    assert [(block.kind, block.text.plain.split("\n")[0]) for block in article.blocks[:5]] == [
+        ("title", "Guide"), ("para", "Introduction."), ("infobox", "Guide"),
+        ("table", "Native name | Name"), ("para", "Second.")]
+    assert (article.anchors["intro"], article.anchors["box"], article.anchors["names"]) == (1, 2, 3)
+
+
+@pytest.mark.parametrize("between", [
+    "<ul><li>Item.</li></ul>", "<h3>Sub</h3>", "<blockquote><p>Quote.</p></blockquote>",
+    "<dl><dd>Indented.</dd></dl>"])
+def test_lead_paragraph_stays_after_lists_quotes_and_headings_below_the_infobox(between):
+    article = parse('<h1>Guide</h1><table class="infobox"><tr><th>Born</th><td>1900</td></tr></table>'
+                    f'{between}<p>Later.</p>')
+    assert [block.kind for block in article.blocks][:2] == ["title", "infobox"]
+    assert article.blocks[-1].text.plain == "Later."
+
+
+def test_infobox_after_the_lead_paragraph_or_without_one_keeps_its_place():
+    after = parse('<h1>Guide</h1><p>First.</p><table class="infobox"><tr><th>A</th><td>B</td></tr></table>'
+                  '<p>Second.</p>')
+    assert [block.kind for block in after.blocks] == ["title", "para", "infobox", "para"]
+    alone = parse('<h1>Guide</h1><table class="infobox"><tr><th>A</th><td>B</td></tr></table>'
+                  '<h2>Part</h2><p>Body.</p>')
+    assert [block.kind for block in alone.blocks] == ["title", "infobox", "h2", "para"]
 
 
 def test_archive_markup_is_literal_in_new_content_types():

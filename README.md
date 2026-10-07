@@ -4,8 +4,9 @@ zimtty is a keyboard-first terminal reader for local ZIM archives, including
 offline Wikipedia and ArchWiki. Search article titles, browse a contents panel,
 follow internal links and section anchors, and move through reading history
 without leaving the terminal. Articles appear one screen-sized page at a time,
-with headings kept beside their text and infoboxes shown alongside the article
-or inline on narrower screens. 
+with headings kept beside their text and infoboxes shown alongside the article.
+On narrower screens an article opens with its first paragraph, followed by a
+framed card of the infobox's first section that `i` expands.
 
 The reader preserves code indentation, lists, captions, and technical warnings.
 Tables keep their columns, including merged cells and multi-row headers, with
@@ -43,6 +44,7 @@ terminal recording can still leave a record outside the app.
     l                            links off/on (plain text, not followable)
     ← / →  backspace             back / forward in history
     a                            jump to "Additional notes" (lead hatnotes/warnings moved there)
+    i                            expand / collapse the infobox card (narrow screens)
     s                            toggle citation markers
     R                            random article
     ?                            key help (press ? again or esc to close)

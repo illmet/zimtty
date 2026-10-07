@@ -115,3 +115,62 @@ async def test_long_code_continuation_survives_history_and_display_toggles():
         assert app._current_place() == place
         app.action_forward()
         assert app.article.path == "docs/Other"
+
+
+def infobox_entry(path, title, fields=30, paragraphs=30):
+    rows = "".join(f"<tr><th>Field {k}</th><td>Value {k}</td></tr>" for k in range(fields))
+    text = "".join(f"<p>Paragraph {k}. " + "Reading text. " * 20 + "</p>" for k in range(paragraphs))
+    return Entry(path, f'<h1>{title}</h1><table class="infobox">{rows}</table>{text}')
+
+
+def all_text(app):
+    return "\n".join(line.plain for page in app.pages for line in page.lines)
+
+
+async def test_infobox_in_the_text_follows_the_lead_and_i_expands_or_collapses_it():
+    app = Reader(MemoryZim([infobox_entry("docs/Start", "Start"),
+                            infobox_entry("docs/Other", "Other")]), "docs/Start")
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.pause()
+        first = page_text(app)
+        assert first.index("Paragraph 0.") < first.index("┌") < first.index("more lines · i")
+        assert "Field 29" not in all_text(app)
+        box = next(i for i, block in enumerate(app.article.blocks) if block.kind == "infobox")
+        # Expanding from anywhere shows the box from its start.
+        app.action_page(4)
+        await pilot.press("i")
+        assert app.info_expanded and "Field 29" in all_text(app)
+        assert app.page_i == app._block_pages(app.pages, box)[0]
+        assert list(app._notifications)[-1].message == "infobox expanded"
+        # Collapsing keeps the reading place.
+        app.action_page(6)
+        reading = app.pages[app.page_i].first_block
+        await pilot.press("i")
+        assert not app.info_expanded and "Field 29" not in all_text(app)
+        assert reading in app.pages[app.page_i].blocks
+        # The expansion belongs to its article.
+        await pilot.press("i")
+        app.action_follow("Other")
+        assert app.article.path == "docs/Other" and not app.info_expanded
+        app.action_back()
+        assert app.article.path == "docs/Start" and not app.info_expanded
+        # Beside the text the box is already whole.
+        await pilot.resize_terminal(150, 40)
+        await pilot.pause()
+        await pilot.press("i")
+        assert not app.info_expanded
+        assert list(app._notifications)[-1].message == "the infobox is shown beside the text"
+
+
+@pytest.mark.parametrize("entry,message", [
+    (infobox_entry("docs/Small", "Small", fields=2, paragraphs=2), "the whole infobox is shown"),
+    (Entry("docs/Plain", "<h1>Plain</h1><p>Text.</p>"), "no infobox on this article"),
+])
+async def test_i_explains_when_there_is_nothing_to_expand(entry, message):
+    app = Reader(MemoryZim([entry]), entry.path)
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.pause()
+        pages = [page.lines for page in app.pages]
+        await pilot.press("i")
+        assert not app.info_expanded and [page.lines for page in app.pages] == pages
+        assert list(app._notifications)[-1].message == message
